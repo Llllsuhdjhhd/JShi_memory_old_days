@@ -269,16 +269,7 @@ def lexical_score(query: str, text: str, *, english_words: bool = False, normali
     # rest of a longer question matches. In particular "lux" previously gave
     # every lux fact the maximum lexical score, burying the requested topic.
     q2 = q[:80]
-    found = 0
-    for length in range(len(q2), 1, -1):
-        hit = False
-        for i in range(0, len(q2) - length + 1):
-            if q2[i : i + length] in t:
-                found = length
-                hit = True
-                break
-        if hit:
-            break
+    found = _longest_common_substring(q2, t)
     # q and t are already simplified and normalized; do not convert twice.
     query_bigrams = {q[i:i + 2] for i in range(max(0, len(q) - 1))}
     text_bigrams = {t[i:i + 2] for i in range(max(0, len(t) - 1))}
@@ -291,6 +282,46 @@ def lexical_score(query: str, text: str, *, english_words: bool = False, normali
         coverage,
         _bigram_jaccard(query_bigrams, text_bigrams),
     )
+
+
+def _longest_common_substring(query: str, text: str) -> int:
+    """Longest common substring length of at least 2, anchored on shared bigrams.
+
+    The previous implementation tried every length from len(query) down to 2 and
+    every offset, i.e. O(len(query)^2) ``in`` scans per memory. A 78-character
+    query spent ~0.6 ms on every one of ~1,100 materials. Any common substring of
+    length >= 2 starts with a bigram shared by both strings, so extending only
+    those anchors returns the same length without scanning the misses. Returns 0
+    when only single characters overlap, matching the lexical score's old floor.
+    """
+    if len(query) < 2 or len(text) < 2:
+        return 0
+    # Search only the anchors that occur in both strings; text.find stays in C and
+    # avoids walking a long raw transcript character by character.
+    positions: dict[str, list[int]] = {}
+    for start in range(len(query) - 1):
+        bigram = query[start : start + 2]
+        if bigram in positions:
+            continue
+        found: list[int] = []
+        index = text.find(bigram)
+        while index != -1:
+            found.append(index)
+            index = text.find(bigram, index + 1)
+        if found:
+            positions[bigram] = found
+    best = 0
+    for start in range(len(query) - 1):
+        for match in positions.get(query[start : start + 2], ()):
+            length = 2
+            limit = min(len(query) - start, len(text) - match)
+            while length < limit and query[start + length] == text[match + length]:
+                length += 1
+            if length > best:
+                best = length
+                if best == len(query):
+                    return best
+    return best
 
 
 def _bigrams(text: str, *, normalizer=_norm) -> set[str]:
@@ -462,9 +493,14 @@ class RecallPipeline:
         budget = self._default_budget_chars if budget_chars is None else int(budget_chars)
         now = datetime.now()
 
+        # Resolve the legacy object timeline once per recall. Before, every event
+        # that missed role/refinement matching opened its own session and queried
+        # object_memory_entries again (232 identical reads for one recall).
+        route_event_ids = self._timeline_event_ids(subject_id, wanted)
         events = [
             ev for ev in self._candidate_events(subject_id)
-            if self._in_time_range(ev, time_range) and self._matches_objects(subject_id, ev, wanted)
+            if self._in_time_range(ev, time_range)
+            and self._matches_objects(subject_id, ev, wanted, route_event_ids=route_event_ids)
         ]
         small_library = bool(events) and len(events) <= self._full_scan_event_limit
         recent_event_ids: set[str] = set()
@@ -712,7 +748,28 @@ class RecallPipeline:
             return False
         return start <= moment <= end
 
-    def _matches_objects(self, subject_id: str, ev: Event, wanted: tuple[str, ...]) -> bool:
+    def _timeline_event_ids(
+        self, subject_id: str, wanted: tuple[str, ...]
+    ) -> frozenset[str]:
+        """Legacy object_timeline route, read once per recall instead of once per event."""
+        if not wanted or self._object_timeline_repo is None:
+            return frozenset()
+        found: set[str] = set()
+        for oid in wanted:
+            found.update(
+                entry.event_id
+                for entry in self._object_timeline_repo.list_by_object(subject_id, oid)
+            )
+        return frozenset(found)
+
+    def _matches_objects(
+        self,
+        subject_id: str,
+        ev: Event,
+        wanted: tuple[str, ...],
+        *,
+        route_event_ids: frozenset[str] | set[str] | None = None,
+    ) -> bool:
         if not wanted:
             return True
         if any(oid in wanted for oid in ev.refinement_objects.values()):
@@ -725,6 +782,8 @@ class RecallPipeline:
             return True
         if any((not role.is_subject) and role.role_id in wanted for role in ev.role_list):
             return True
+        if route_event_ids is not None:
+            return ev.event_id in route_event_ids
         route = self._object_route(subject_id, wanted[0], [ev])
         if len(wanted) == 1:
             return ev.event_id in route
@@ -756,20 +815,33 @@ class RecallPipeline:
             from ..services.refinement_service import utc
             ranges = {"event_time_start": (None, utc(end).timestamp()),
                       "event_time_end": (utc(start).timestamp(), None)}
+        limit = self._top_k if top_k is None else top_k
+        payload_filter = {
+            "subject_id": subject_id,
+            "embedding_model": self._embedding_model,
+            "embedding_version": self._embedding_version,
+        }
+        wanted_filter = {"object_ids": list(wanted)} if wanted else {}
         hits = self._vector_store.search(
             vector,
-            top_k=self._top_k if top_k is None else top_k,
-            payload_filter={
-                "subject_id": subject_id,
-                "embedding_model": self._embedding_model,
-                "embedding_version": self._embedding_version,
-            },
-            any_of={
-                **({"object_ids": list(wanted)} if wanted else {}),
-                **({"event_id": list(event_ids)} if event_ids is not None else {}),
-            } or None,
+            top_k=limit,
+            payload_filter=payload_filter,
+            any_of=wanted_filter or None,
             ranges=ranges,
         )
+        if event_ids is not None and len(hits) >= limit:
+            # qdrant-local evaluates a MatchAny list once per stored point, so a
+            # list as long as the library costs O(points x events). Only apply the
+            # id filter when the unfiltered search was actually truncated; if it
+            # returned fewer than `limit` hits, every point is already present and
+            # the ids cannot change the outcome.
+            hits = self._vector_store.search(
+                vector,
+                top_k=limit,
+                payload_filter=payload_filter,
+                any_of={**wanted_filter, "event_id": list(event_ids)},
+                ranges=ranges,
+            )
         scores: dict[tuple[str, str, str], float] = {}
         for hit in hits:
             payload = hit.get("payload") or {}

@@ -80,8 +80,14 @@ _FALLBACK_T2S = str.maketrans(
 )
 
 
+@lru_cache(maxsize=4096)
 def to_simplified(text: str) -> str:
-    """Normalize *text* to simplified Chinese for name / alias matching."""
+    """Normalize *text* to simplified Chinese for name / alias matching.
+
+    Pure text -> text, so the cache key is the content itself: edited or newly
+    sealed memories produce a new key instead of a stale conversion. Bounded so a
+    long-lived process does not retain an unbounded transcript archive.
+    """
     if not text:
         return ""
     converter = _opencc_t2s()
