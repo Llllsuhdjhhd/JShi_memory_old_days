@@ -31,11 +31,26 @@
 - 一个候选的原始相关度是 `min(1, max(semantic, lexical) + 0.25 × min(semantic, lexical))`。词面与语义同时匹配时得到小幅加分；可及性不乘入向量分数。
 - 指定对象时，历史对话对象候选使用 0.7 权重，其他涉及对象使用 0.3 权重；未指定对象时对象权重为 1.0。权重作用于排序分。
 
-## 可及性、近期通道与长期通道
+## 候选级联、可及性与通道
 
-事件数不超过 `recall_max_capacity`（默认 1000）时，全部符合主体、对象和时间过滤的事件都参加语义搜索；不做长期概率抽样。向量搜索的 `top_k` 至少为候选事件数的三十二倍，以覆盖事件、对象事实和挂在上层事件上的原文向量。小库排序严格按相关度；可及性只在同分时打破平局，近期候选不强行前置。
+事件数不超过 `recall_cascade_min_events`（默认 200）时走全量扫描：全部符合主体、对象和时间过滤的事件都参加语义与词面检索，排序严格按相关度；可及性只在同分时打破平局。
 
-事件数超过该上限时，采用“近期保底 + 长期概率采样”的语义检索路径：
+超过该阈值且 `recall_candidate_mode="cascade"`（默认）时，召回先由四路生成有界候选，再只加载并精排这些事件：
+
+1. 语义路：向量 `top_k=recall_candidate_vector_k`（默认 200）。
+2. 词面路：SQLite FTS5 trigram `top_k=recall_candidate_lexical_k`（默认 200）；2 字查询走受限 `LIKE`。
+3. 近期路：最新 `recall_candidate_recent_k`（默认 80）条。
+4. 对象路：`role_list`、`refinement_objects`、历史对话对象关系，每个对象最多 `recall_candidate_route_k`（默认 100）条；旧 `object_timeline` 路由也并入。
+
+四路按 event_id 去重后取 `recall_candidate_limit`（默认 500）。随后仍然用精确词面分、语义分、对象权重和可及性排序；候选路只负责“找”，不改变最终打分口径。语义路只覆盖自己的 top-K；词面/近期候选不在其中时，会按 `recall_candidate_semantic_backfill`（默认 100）补一次受限语义分，避免 `max(semantic, lexical)` 系统性压低 FTS 命中。
+
+候选生成少于 `recall_candidate_min_events`（默认 8）时回退全量扫描；`recall_candidate_mode="full"` 可整体关闭级联。级联路径不再使用原来的“近期保底 + 长期概率采样”选池；可及性仍参与候选排序，但不再决定哪些老事件能被语义检索到。
+
+FTS5 是派生索引：`events` 仍是唯一事实源，触发器在 insert/update/delete 时同步 `content_raw` 与摘要值；首次在已有库启动时 backfill 一次。trigram 对 2 字查询无法命中，因此 2 字走 `LIKE`；FTS 不可用时自动退回全量扫描。
+
+### 全量模式下的长期概率采样
+
+`recall_candidate_mode="full"` 且事件数超过 `recall_max_capacity`（默认 1000）时，仍使用“近期保底 + 长期概率采样”：
 
 1. 对完成主体、对象、时间过滤的事件，按 `create_time` 从新到旧排序。
 2. 最新的 80 条进入近期语义池，近期语义搜索的 `top_k` 默认是 40。
@@ -50,9 +65,7 @@ effective_access = event_fatigue * forgetting_factor * age_decay
 p = floor + (1 - floor) * effective_access / (1 + effective_access)
 ```
 
-默认半衰期为 60 天，长期概率下限为 0.05。`event_fatigue` 是配置值；`forgetting_factor` 在事件封装时由情绪唤醒度初始化，并可在回忆命中后增长。低可及性会降低长期语义池的入选机会，但概率下限仍允许偶然搜索到。
-
-**当前边界：**长期概率采样只控制语义搜索池。词面通道仍会遍历已通过硬过滤的事件。因此“事件以该概率参与全部检索”并不准确；概率目前不是全局候选闸门，也不会删除事件。
+默认半衰期为 60 天，长期概率下限为 0.05。`event_fatigue` 是配置值；`forgetting_factor` 在事件封装时由情绪唤醒度初始化，并可在回忆命中后增长。该路径只控制语义搜索池；词面通道仍会遍历已通过硬过滤的事件。
 
 ## 排序与重复强化
 

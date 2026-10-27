@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Optional
+import logging
+from typing import Optional, Sequence
 from contextlib import nullcontext
 
 # 仓储层：Event/Role/Metabolism 的 CRUD 与 ORM ↔ Pydantic 模型转换。
@@ -13,7 +14,7 @@ from datetime import datetime
 
 from ..models.portrait import ObjectPortrait, PendingPortraitSummary, PortraitLevelInfo
 from ..port import RecallTrace
-from sqlalchemy import func
+from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError
 
 from .database import (
@@ -30,6 +31,8 @@ from .database import (
     UnclosedEventRecord,
     WhitePaintingRecord,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # =====================================================================
@@ -207,6 +210,147 @@ class EventRepository:
             if exclude_tombstoned:
                 q = q.filter(EventRecord.is_tombstoned == False)  # noqa: E712
             return [self._to_model(r) for r in q.order_by(EventRecord.create_time).all()]
+
+    def count_by_subject(
+        self, subject_id: str, *, exclude_tombstoned: bool = True
+    ) -> int:
+        """Cheap candidate-mode switch; no Event objects are built."""
+        with self._db.session() as s:
+            q = s.query(func.count(EventRecord.event_id)).filter(
+                func.coalesce(EventRecord.subject_id, "") == subject_id
+            )
+            if exclude_tombstoned:
+                q = q.filter(EventRecord.is_tombstoned == False)  # noqa: E712
+            return int(q.scalar() or 0)
+
+    def recent_ids_by_subject(self, subject_id: str, limit: int) -> list[str]:
+        """Newest event ids for the recency lane, newest first."""
+        if limit <= 0:
+            return []
+        with self._db.session() as s:
+            rows = (
+                s.query(EventRecord.event_id)
+                .filter(
+                    func.coalesce(EventRecord.subject_id, "") == subject_id,
+                    EventRecord.is_tombstoned == False,  # noqa: E712
+                )
+                .order_by(EventRecord.create_time.desc())
+                .limit(limit)
+                .all()
+            )
+            return [row[0] for row in rows]
+
+    def ids_for_object(self, subject_id: str, object_id: str, limit: int) -> list[str]:
+        """Object-route candidate ids without loading events into Python.
+
+        Covers the same three relations as ``_matches_objects``: role list,
+        refinement objects and historical interlocutor attributions. SQLite JSON1
+        keeps the filter in the database; a dedicated event_objects table can
+        replace this scan once the library is large enough to need one.
+        """
+        if not object_id or limit <= 0:
+            return []
+        statement = text("""
+            SELECT event_id
+            FROM events
+            WHERE coalesce(subject_id, '') = :subject_id
+              AND is_tombstoned = 0
+              AND (
+                EXISTS (SELECT 1 FROM json_each(events.role_list)
+                        WHERE json_extract(value, '$.role_id') = :object_id)
+                OR EXISTS (SELECT 1 FROM json_each(
+                               events.recall_metadata,
+                               '$.refinement.refinement_objects')
+                           WHERE value = :object_id)
+                OR EXISTS (SELECT 1 FROM json_each(
+                               events.recall_metadata, '$.interlocutor_attributions')
+                           WHERE json_extract(value, '$.object_id') = :object_id)
+              )
+            ORDER BY create_time DESC
+            LIMIT :limit
+        """)
+        with self._db.session() as s:
+            rows = s.execute(statement, {
+                "subject_id": subject_id,
+                "object_id": object_id,
+                "limit": limit,
+            })
+            return [row[0] for row in rows]
+
+    def list_by_ids(
+        self, event_ids: Sequence[str], *, subject_id: str | None = None
+    ) -> list[Event]:
+        """Load only the candidate ids, chunked for SQLite's variable limit."""
+        ids = tuple(dict.fromkeys(event_ids))
+        if not ids:
+            return []
+        found: list[Event] = []
+        with self._db.session() as s:
+            for offset in range(0, len(ids), 500):
+                q = s.query(EventRecord).filter(
+                    EventRecord.event_id.in_(ids[offset : offset + 500])
+                )
+                if subject_id is not None:
+                    q = q.filter(func.coalesce(EventRecord.subject_id, "") == subject_id)
+                found.extend(self._to_model(r) for r in q.all())
+        found.sort(key=lambda e: e.create_time)
+        return found
+
+    def search_fts(
+        self, subject_id: str, query: str, limit: int, *, min_chars: int = 3
+    ) -> list[str]:
+        """Lexical candidate ids from the derived FTS5 table.
+
+        Chinese trigram matching needs at least three characters; shorter queries
+        use a bounded LIKE scan so two-character names still form a candidate
+        lane. Any FTS failure returns an empty lane and lets recall fall back.
+        """
+        q = (query or "").strip()
+        if not q or limit <= 0:
+            return []
+        if len(q) < min_chars:
+            return self._search_like(subject_id, q, limit)
+        match = '"' + q.replace('"', '""') + '"'
+        statement = text("""
+            SELECT events_fts.event_id
+            FROM events_fts JOIN events e ON e.event_id = events_fts.event_id
+            WHERE events_fts MATCH :match
+              AND coalesce(e.subject_id, '') = :subject_id
+              AND e.is_tombstoned = 0
+            ORDER BY rank
+            LIMIT :limit
+        """)
+        try:
+            with self._db.session() as s:
+                rows = s.execute(statement, {
+                    "match": match, "subject_id": subject_id, "limit": limit,
+                })
+                return [row[0] for row in rows]
+        except Exception:  # noqa: BLE001 - FTS is an optional accelerator
+            logger.warning("FTS candidate query failed; full scan remains", exc_info=True)
+            return []
+
+    def _search_like(self, subject_id: str, query: str, limit: int) -> list[str]:
+        escaped = (
+            query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        )
+        statement = text("""
+            SELECT event_id
+            FROM events
+            WHERE coalesce(subject_id, '') = :subject_id
+              AND is_tombstoned = 0
+              AND (content_raw LIKE :pattern ESCAPE '\\'
+                   OR summaries LIKE :pattern ESCAPE '\\')
+            ORDER BY create_time DESC
+            LIMIT :limit
+        """)
+        with self._db.session() as s:
+            rows = s.execute(statement, {
+                "subject_id": subject_id,
+                "pattern": f"%{escaped}%",
+                "limit": limit,
+            })
+            return [row[0] for row in rows]
 
     def count(
         self,

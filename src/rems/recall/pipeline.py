@@ -390,6 +390,15 @@ class RecallPipeline:
         recency_window_events: int = 80,
         recency_top_k: int = 40,
         full_scan_event_limit: int = 1000,
+        candidate_mode: str = "cascade",
+        cascade_min_events: int = 200,
+        candidate_limit: int = 500,
+        candidate_vector_k: int = 200,
+        candidate_lexical_k: int = 200,
+        candidate_recent_k: int = 80,
+        candidate_route_k: int = 100,
+        candidate_semantic_backfill: int = 100,
+        candidate_min_events: int = 8,
         long_term_probability_floor: float = 0.05,
         factor_alpha: float = 0.5,
         mood_beta: float = 0.2,
@@ -428,6 +437,17 @@ class RecallPipeline:
         self._recency_window_events = recency_window_events
         self._recency_top_k = recency_top_k
         self._full_scan_event_limit = max(0, int(full_scan_event_limit))
+        self._candidate_mode = str(candidate_mode or "full").strip().lower()
+        if self._candidate_mode not in {"full", "cascade"}:
+            self._candidate_mode = "full"
+        self._cascade_min_events = max(0, int(cascade_min_events))
+        self._candidate_limit = max(1, int(candidate_limit))
+        self._candidate_vector_k = max(1, int(candidate_vector_k))
+        self._candidate_lexical_k = max(0, int(candidate_lexical_k))
+        self._candidate_recent_k = max(0, int(candidate_recent_k))
+        self._candidate_route_k = max(0, int(candidate_route_k))
+        self._candidate_semantic_backfill = max(0, int(candidate_semantic_backfill))
+        self._candidate_min_events = max(1, int(candidate_min_events))
         self._long_term_probability_floor = min(
             max(float(long_term_probability_floor), 0.0), 0.99,
         )
@@ -456,6 +476,83 @@ class RecallPipeline:
             self._semantic_min if detail_min_similarity is None else float(detail_min_similarity)
         )
         self._date_anchor_locale = date_anchor_locale if date_anchor_locale in {"zh", "en"} else "zh"
+
+    # ------------------------------------------------------------------
+    def _cascade_available(self) -> bool:
+        return (
+            self._candidate_mode == "cascade"
+            and all(
+                callable(getattr(self._event_repo, name, None))
+                for name in (
+                    "count_by_subject",
+                    "list_by_ids",
+                    "recent_ids_by_subject",
+                    "search_fts",
+                )
+            )
+        )
+
+    def _cascade_candidate_ids(
+        self,
+        subject_id: str,
+        query: str,
+        wanted: tuple[str, ...],
+        time_range: tuple[datetime, datetime] | None,
+        query_vector: list[float] | None,
+        route_event_ids: frozenset[str],
+        *,
+        use_semantic: bool,
+        use_lexical: bool,
+    ) -> tuple[list[str], dict[tuple[str, str, str], float], set[str]]:
+        """Union bounded candidates from the four retrieval lanes.
+
+        Vector and lexical lanes each contribute their own top-K. The recency lane
+        guarantees the newest window, and the legacy object timeline contributes
+        object-route events. Later grading still uses exact lexical scores, so a
+        lane only has to put the memory into the candidate set, not rank it.
+        """
+        semantic: dict[tuple[str, str, str], float] = {}
+        ids: list[str] = []
+        if use_semantic and query_vector is not None:
+            semantic = self._semantic_signals(
+                subject_id, query, wanted, time_range,
+                query_vector=query_vector,
+                top_k=self._candidate_vector_k,
+            )
+            ids.extend(key[1] for key in semantic)
+        if use_lexical and self._candidate_lexical_k > 0:
+            ids.extend(self._event_repo.search_fts(
+                subject_id, query, self._candidate_lexical_k))
+        recent_ids = set(self._event_repo.recent_ids_by_subject(
+            subject_id, self._candidate_recent_k))
+        ids.extend(recent_ids)
+        if wanted:
+            object_lane = getattr(self._event_repo, "ids_for_object", None)
+            if callable(object_lane):
+                for object_id in wanted:
+                    ids.extend(object_lane(subject_id, object_id, self._candidate_route_k))
+        if route_event_ids and self._candidate_route_k > 0:
+            ids.extend(list(route_event_ids)[-self._candidate_route_k:])
+        unique = list(dict.fromkeys(ids))[: self._candidate_limit]
+
+        # Vector search only scored its own top-K. Score a bounded number of
+        # lexical/recent candidates that missed that cut, so max(semantic,
+        # lexical) is not biased against FTS-only hits.
+        if use_semantic and query_vector is not None and unique:
+            covered = {key[1] for key in semantic}
+            missing = [
+                event_id for event_id in unique if event_id not in covered
+            ][: self._candidate_semantic_backfill]
+            if missing:
+                extra = self._semantic_signals(
+                    subject_id, query, wanted, time_range,
+                    query_vector=query_vector,
+                    event_ids=tuple(missing),
+                    top_k=len(missing),
+                )
+                for key, score in extra.items():
+                    semantic.setdefault(key, score)
+        return unique, semantic, recent_ids
 
     # ------------------------------------------------------------------
     def recall(
@@ -497,56 +594,101 @@ class RecallPipeline:
         # that missed role/refinement matching opened its own session and queried
         # object_memory_entries again (232 identical reads for one recall).
         route_event_ids = self._timeline_event_ids(subject_id, wanted)
-        events = [
-            ev for ev in self._candidate_events(subject_id)
-            if self._in_time_range(ev, time_range)
-            and self._matches_objects(subject_id, ev, wanted, route_event_ids=route_event_ids)
-        ]
-        small_library = bool(events) and len(events) <= self._full_scan_event_limit
+
+        # Candidate cascade: bounded vector / FTS / recent / object lanes, then
+        # load only their union. Adapters without the new repository methods, and
+        # libraries below the cascade floor, keep the full scan untouched.
+        cascade = self._cascade_available()
+        total_events = 0
+        if cascade:
+            total_events = self._event_repo.count_by_subject(subject_id)
+            cascade = total_events > self._cascade_min_events
+        query_vector = None
         recent_event_ids: set[str] = set()
         semantic: dict[tuple[str, str, str], float] = {}
-        if use_semantic:
-            query_vector = self._embedding.embed_query(q)
-            if small_library:
-                # In a small library every event can participate. Sampling here
-                # made old but relevant memories disappear between identical calls.
-                semantic = self._semantic_signals(
-                    subject_id, q, wanted, time_range,
-                    query_vector=query_vector,
-                    event_ids=tuple(event.event_id for event in events),
-                    top_k=max(self._top_k, len(events) * 32),
+        small_library = False
+        if cascade:
+            if use_semantic:
+                query_vector = self._embedding.embed_query(q)
+            candidate_ids, semantic, recent_event_ids = self._cascade_candidate_ids(
+                subject_id, q, wanted, time_range, query_vector, route_event_ids,
+                use_semantic=use_semantic, use_lexical=use_lexical,
+            )
+            if len(candidate_ids) < self._candidate_min_events:
+                # Generation itself failed (no vector/FTS/recent/route hit), not
+                # merely the object/time filter. Fall back before paying for load.
+                logger.info(
+                    "recall cascade generated %d candidates; full scan fallback",
+                    len(candidate_ids),
                 )
-                if self._recency_enabled:
-                    recent_event_ids = {
-                        ev.event_id for ev in events[-self._recency_window_events:]
-                    } if self._recency_window_events > 0 else set()
-            elif self._recency_enabled:
-                recent_events, long_term_events = self._split_semantic_pools(events, now)
-                recent_event_ids = {ev.event_id for ev in recent_events}
-                if recent_events:
-                    semantic.update(self._semantic_signals(
-                        subject_id, q, wanted, time_range,
-                        query_vector=query_vector,
-                        event_ids=tuple(ev.event_id for ev in recent_events),
-                        top_k=max(1, self._recency_top_k),
-                    ))
-                if long_term_events:
-                    long_term_signals = self._semantic_signals(
-                        subject_id, q, wanted, time_range,
-                        query_vector=query_vector,
-                        event_ids=tuple(ev.event_id for ev in long_term_events),
-                        top_k=self._top_k,
-                    )
-                    for key, score in long_term_signals.items():
-                        semantic[key] = max(semantic.get(key, 0.0), score)
+                cascade = False
+                semantic = {}
+                recent_event_ids = set()
+            else:
+                events = self._event_repo.list_by_ids(candidate_ids, subject_id=subject_id)
+                events = [
+                    ev for ev in events
+                    if not ev.is_tombstoned and not ev.refinement_hidden_by
+                    and self._in_time_range(ev, time_range)
+                    and self._matches_objects(subject_id, ev, wanted, route_event_ids=route_event_ids)
+                ]
+                recent_event_ids &= {ev.event_id for ev in events}
+                small_library = total_events <= self._full_scan_event_limit
                 logger.debug(
-                    "recall semantic pools: eligible=%d recent=%d long_term_selected=%d",
-                    len(events), len(recent_events), len(long_term_events),
+                    "recall cascade: total=%d generated=%d eligible=%d",
+                    total_events, len(candidate_ids), len(events),
                 )
-            elif events:
-                semantic = self._semantic_signals(
-                    subject_id, q, wanted, time_range, query_vector=query_vector,
-                )
+        if not cascade:
+            events = [
+                ev for ev in self._candidate_events(subject_id)
+                if self._in_time_range(ev, time_range)
+                and self._matches_objects(subject_id, ev, wanted, route_event_ids=route_event_ids)
+            ]
+            small_library = bool(events) and len(events) <= self._full_scan_event_limit
+            if use_semantic:
+                if query_vector is None:
+                    query_vector = self._embedding.embed_query(q)
+                if small_library:
+                    # In a small library every event can participate. Sampling here
+                    # made old but relevant memories disappear between identical calls.
+                    semantic = self._semantic_signals(
+                        subject_id, q, wanted, time_range,
+                        query_vector=query_vector,
+                        event_ids=tuple(event.event_id for event in events),
+                        top_k=max(self._top_k, len(events) * 32),
+                    )
+                    if self._recency_enabled:
+                        recent_event_ids = {
+                            ev.event_id for ev in events[-self._recency_window_events:]
+                        } if self._recency_window_events > 0 else set()
+                elif self._recency_enabled:
+                    recent_events, long_term_events = self._split_semantic_pools(events, now)
+                    recent_event_ids = {ev.event_id for ev in recent_events}
+                    if recent_events:
+                        semantic.update(self._semantic_signals(
+                            subject_id, q, wanted, time_range,
+                            query_vector=query_vector,
+                            event_ids=tuple(ev.event_id for ev in recent_events),
+                            top_k=max(1, self._recency_top_k),
+                        ))
+                    if long_term_events:
+                        long_term_signals = self._semantic_signals(
+                            subject_id, q, wanted, time_range,
+                            query_vector=query_vector,
+                            event_ids=tuple(ev.event_id for ev in long_term_events),
+                            top_k=self._top_k,
+                        )
+                        for key, score in long_term_signals.items():
+                            semantic[key] = max(semantic.get(key, 0.0), score)
+                    logger.debug(
+                        "recall semantic pools: eligible=%d recent=%d long_term_selected=%d",
+                        len(events), len(recent_events), len(long_term_events),
+                    )
+                elif events:
+                    semantic = self._semantic_signals(
+                        subject_id, q, wanted, time_range, query_vector=query_vector,
+                    )
+
         # Reuse the loaded events and fetch fallback facts once per recall.
         # Local state only: concurrent recalls and later writes cannot reuse stale facts.
         fact_entries = None

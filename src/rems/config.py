@@ -211,10 +211,25 @@ class REMSConfig(BaseSettings):
     recall_summary_min_chars: int = 20
     
     # ---- Recall Capacity & Tiered Retrieval (70/30 Rule) ----
-    # 系统级全量检索容量上限（基本事件数）。低于此值全量可见；超过后开启 70/30 分层。
+    # 全量模式的容量上限（基本事件数）。cascade 模式改由 recall_cascade_min_events
+    # 控制是否启用候选级联；两者都只影响检索路径，不删除事件。
     recall_max_capacity: int = 1000
-    # 分层比例：最近 N% 的条目对全局可见，剩余部分仅焦点角色关联可见。
+    # 仅 full 模式的分层比例：最近 N% 对全局可见，剩余部分按可及性抽样。
     recall_global_ratio: float = 0.7
+
+    # ---- Recall candidate cascade（有界候选 + FTS/向量/近期/对象四路） ----
+    # full：保持原来的全量扫描；cascade：先取候选 id，再只加载这些事件。
+    # 少于 cascade_min_events 的库仍走全量，测试与小库行为不变。
+    recall_candidate_mode: str = "cascade"
+    recall_cascade_min_events: int = 200
+    recall_candidate_limit: int = 500
+    recall_candidate_vector_k: int = 200
+    recall_candidate_lexical_k: int = 200
+    recall_candidate_recent_k: int = 80
+    recall_candidate_route_k: int = 100
+    recall_candidate_semantic_backfill: int = 100
+    # 候选过滤后少于此数就回退全量扫描，避免对象/时间过滤把候选清空。
+    recall_candidate_min_events: int = 8
 
     # ---- Recall trace（回忆内容落库，observability / 召回质量回溯） ----
     # 每次 recall 调用把输入与命中的回忆条目写入 ``recall_traces`` 表；

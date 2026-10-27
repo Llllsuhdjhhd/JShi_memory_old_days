@@ -383,6 +383,7 @@ class Database:
         Base.metadata.create_all(self.engine)
         self._migrate_missing_columns()
         self._ensure_indexes()
+        self._ensure_fts()
 
     def _ensure_indexes(self) -> None:
         """Create indexes on existing SQLite tables; create_all skips existing tables.
@@ -405,6 +406,69 @@ class Database:
         with self.engine.begin() as conn:
             for statement in statements:
                 conn.execute(text(statement))
+
+    def _ensure_fts(self) -> None:
+        """Maintain a derived trigram FTS index for the lexical candidate lane.
+
+        The events table stays the only source of truth. Triggers copy the current
+        raw text and summary values into ``events_fts`` on insert/update/delete;
+        the first startup on an existing database backfills once. FTS5 is optional:
+        if this SQLite build lacks it, recall keeps its full-scan fallback.
+        """
+        from sqlalchemy import text
+
+        if not self.engine.url.get_backend_name().startswith("sqlite"):
+            return
+        try:
+            with self.engine.begin() as conn:
+                conn.execute(text(
+                    "CREATE VIRTUAL TABLE IF NOT EXISTS events_fts USING fts5("
+                    "event_id UNINDEXED, text, tokenize='trigram')"
+                ))
+                for trigger in ("events_fts_ai", "events_fts_au", "events_fts_ad"):
+                    conn.execute(text(f"DROP TRIGGER IF EXISTS {trigger}"))
+                conn.execute(text("""
+                    CREATE TRIGGER events_fts_ai AFTER INSERT ON events BEGIN
+                      INSERT INTO events_fts(rowid, event_id, text)
+                      VALUES (new.rowid, new.event_id,
+                              coalesce(new.content_raw, '') || ' ' ||
+                              coalesce((SELECT group_concat(value, ' ')
+                                        FROM json_each(new.summaries)), ''));
+                    END
+                """))
+                conn.execute(text("""
+                    CREATE TRIGGER events_fts_au
+                    AFTER UPDATE OF content_raw, summaries ON events BEGIN
+                      DELETE FROM events_fts WHERE rowid = old.rowid;
+                      INSERT INTO events_fts(rowid, event_id, text)
+                      VALUES (new.rowid, new.event_id,
+                              coalesce(new.content_raw, '') || ' ' ||
+                              coalesce((SELECT group_concat(value, ' ')
+                                        FROM json_each(new.summaries)), ''));
+                    END
+                """))
+                conn.execute(text("""
+                    CREATE TRIGGER events_fts_ad AFTER DELETE ON events BEGIN
+                      DELETE FROM events_fts WHERE rowid = old.rowid;
+                    END
+                """))
+                events = conn.execute(text("SELECT count(*) FROM events")).scalar() or 0
+                aligned = conn.execute(text("""
+                    SELECT count(*) FROM events_fts f
+                    JOIN events e ON e.rowid = f.rowid AND e.event_id = f.event_id
+                """)).scalar() or 0
+                if events != aligned:
+                    conn.execute(text("DELETE FROM events_fts"))
+                    conn.execute(text("""
+                        INSERT INTO events_fts(rowid, event_id, text)
+                        SELECT e.rowid, e.event_id,
+                               coalesce(e.content_raw, '') || ' ' ||
+                               coalesce((SELECT group_concat(value, ' ')
+                                         FROM json_each(e.summaries)), '')
+                        FROM events e
+                    """))
+        except Exception:  # noqa: BLE001 - FTS is an optional accelerator
+            logger.warning("SQLite FTS5 unavailable; recall keeps full scan", exc_info=True)
 
     def _migrate_missing_columns(self) -> None:
         """Lightweight in-place migration for new columns introduced after initial schema.
