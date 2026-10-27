@@ -13,6 +13,7 @@ from datetime import datetime
 
 from ..models.portrait import ObjectPortrait, PendingPortraitSummary, PortraitLevelInfo
 from ..port import RecallTrace
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 
 from .database import (
@@ -185,6 +186,24 @@ class EventRepository:
                 q = q.filter(EventRecord.is_abstracted == is_abstracted)
             if status is not None:
                 q = q.filter(EventRecord.status == status.value)
+            if exclude_tombstoned:
+                q = q.filter(EventRecord.is_tombstoned == False)  # noqa: E712
+            return [self._to_model(r) for r in q.order_by(EventRecord.create_time).all()]
+
+    def list_by_subject(
+        self, subject_id: str, *, exclude_tombstoned: bool = True
+    ) -> list[Event]:
+        """Subject-scoped variant of :meth:`list_all` for the recall candidate load.
+
+        Filters in SQL (``ix_events_subject_tombstone_time``) instead of loading
+        every subject's events and discarding them in Python. Order and the
+        tombstone rule match :meth:`list_all`; ``coalesce`` keeps legacy NULL
+        subject rows equivalent to the old ``(e.subject_id or "")`` comparison.
+        """
+        with self._db.session() as s:
+            q = s.query(EventRecord).filter(
+                func.coalesce(EventRecord.subject_id, "") == subject_id
+            )
             if exclude_tombstoned:
                 q = q.filter(EventRecord.is_tombstoned == False)  # noqa: E712
             return [self._to_model(r) for r in q.order_by(EventRecord.create_time).all()]

@@ -382,6 +382,29 @@ class Database:
     def create_tables(self) -> None:
         Base.metadata.create_all(self.engine)
         self._migrate_missing_columns()
+        self._ensure_indexes()
+
+    def _ensure_indexes(self) -> None:
+        """Create indexes on existing SQLite tables; create_all skips existing tables.
+
+        These are query-path indexes only: they do not change any stored value or
+        recall ranking. ``IF NOT EXISTS`` makes startup idempotent.
+        """
+        from sqlalchemy import text
+
+        if not self.engine.url.get_backend_name().startswith("sqlite"):
+            return
+        statements = (
+            "CREATE INDEX IF NOT EXISTS ix_events_subject_tombstone_time "
+            "ON events (subject_id, is_tombstoned, create_time)",
+            "CREATE INDEX IF NOT EXISTS ix_white_painting_entries_event_id "
+            "ON white_painting_entries (event_id)",
+            "CREATE INDEX IF NOT EXISTS ix_object_memory_entries_lookup "
+            "ON object_memory_entries (subject_id, object_id, create_time)",
+        )
+        with self.engine.begin() as conn:
+            for statement in statements:
+                conn.execute(text(statement))
 
     def _migrate_missing_columns(self) -> None:
         """Lightweight in-place migration for new columns introduced after initial schema.

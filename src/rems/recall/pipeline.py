@@ -1364,8 +1364,14 @@ class RecallPipeline:
 
     # ------------------------------------------------------------------
     def _candidate_events(self, subject_id: str) -> list[Event]:
+        lister = getattr(self._event_repo, "list_by_subject", None)
+        rows = (
+            lister(subject_id, exclude_tombstoned=True)
+            if callable(lister)
+            else self._event_repo.list_all(exclude_tombstoned=True)
+        )
         return [
-            e for e in self._event_repo.list_all(exclude_tombstoned=True)
+            e for e in rows
             if (e.subject_id or "") == subject_id and not e.is_tombstoned and not e.refinement_hidden_by
         ]
 
