@@ -301,16 +301,29 @@ class EventRepository:
     ) -> list[str]:
         """Lexical candidate ids from the derived FTS5 table.
 
-        Chinese trigram matching needs at least three characters; shorter queries
-        use a bounded LIKE scan so two-character names still form a candidate
-        lane. Any FTS failure returns an empty lane and lets recall fall back.
+        Trigram matching is a bag-of-trigrams OR query, not a phrase: a long
+        utterance is almost never one contiguous event substring, while its
+        individual trigrams still identify the relevant memories. bm25 ranks by
+        the matched trigrams; exact lexical scoring happens later on candidates.
+        Queries shorter than three characters use a bounded LIKE scan.
         """
         q = (query or "").strip()
         if not q or limit <= 0:
             return []
-        if len(q) < min_chars:
+        from ..utils.zh_normalize import normalize_for_substring_match
+
+        clean = "".join(
+            char for char in normalize_for_substring_match(q) if char.isalnum()
+        )
+        if len(clean) < min_chars:
             return self._search_like(subject_id, q, limit)
-        match = '"' + q.replace('"', '""') + '"'
+        trigrams = list(dict.fromkeys(
+            clean[index : index + 3] for index in range(len(clean) - 2)
+        ))
+        if len(trigrams) > 128:
+            step = len(trigrams) / 128
+            trigrams = [trigrams[int(index * step)] for index in range(128)]
+        match = " OR ".join('"' + gram.replace('"', '""') + '"' for gram in trigrams)
         statement = text("""
             SELECT events_fts.event_id
             FROM events_fts JOIN events e ON e.event_id = events_fts.event_id

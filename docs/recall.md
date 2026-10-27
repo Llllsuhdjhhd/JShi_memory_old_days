@@ -46,7 +46,7 @@
 
 候选生成少于 `recall_candidate_min_events`（默认 8）时回退全量扫描；`recall_candidate_mode="full"` 可整体关闭级联。级联路径不再使用原来的“近期保底 + 长期概率采样”选池；可及性仍参与候选排序，但不再决定哪些老事件能被语义检索到。
 
-FTS5 是派生索引：`events` 仍是唯一事实源，触发器在 insert/update/delete 时同步 `content_raw` 与摘要值；首次在已有库启动时 backfill 一次。trigram 对 2 字查询无法命中，因此 2 字走 `LIKE`；FTS 不可用时自动退回全量扫描。
+FTS5 是派生索引：`events` 仍是唯一事实源，触发器在 insert/update/delete 时同步 `content_raw` 与摘要值；首次在已有库启动时 backfill 一次。词面路按 trigram 的 OR 查询匹配（长句不要求整句连续），短于 3 字走受限 `LIKE`；FTS 不可用时自动退回全量扫描。
 
 ### 全量模式下的长期概率采样
 
