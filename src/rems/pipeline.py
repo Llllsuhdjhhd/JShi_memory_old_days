@@ -285,6 +285,16 @@ class REMSPipeline:
             if not (inp.text or "").strip():
                 result.errors.append(f"segment {inp.segment_id or '?'}: empty text")
                 continue
+            from .utils.simplified_text import simplify_text
+            text = simplify_text(inp.text)
+            if text != inp.text:
+                from sqlalchemy import text as sql_text
+                import json, hashlib
+                raw = json.dumps(inp.model_dump(mode="json"), ensure_ascii=False)
+                with self.db.engine.begin() as connection:
+                    connection.execute(sql_text("INSERT OR IGNORE INTO simplified_originals(id,table_name,record_key,field_name,original_json,created_at) VALUES(:id,'ingest',:key,'text',:raw,datetime('now'))"),
+                        {"id":hashlib.sha256(raw.encode()).hexdigest(),"key":inp.segment_id or "","raw":raw})
+                inp = inp.model_copy(update={"text":text})
             valid.append(inp)
 
         if valid:

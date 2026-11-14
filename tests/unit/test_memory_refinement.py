@@ -685,7 +685,7 @@ def _seed_residual(pipe, text, *, when, identity):
     ))
 
 
-def test_short_residual_waits_three_days_and_seals_at_seven(case):
+def test_short_residual_closes_at_time_boundary_and_idle_fallback_still_works(case):
     pipe, _, llm = case
     now = datetime(2026, 6, 1, 12, 0, 0)
     short = "我们去湖边散步，聊得很开心。"
@@ -694,9 +694,9 @@ def test_short_residual_waits_three_days_and_seals_at_seven(case):
     memory = MemoryExperience(subject_id="stone", text="然后呢。", objects={"甲": "jia"},
         source_ids=("next",), segment_id="next", occurred_at=now)
     waiting = pipe.metabolism_service.process_input("然后呢。", memory=memory)
-    assert waiting == []
+    assert [event.content_raw for event in waiting] == [short]
     held = "\n".join(item.merged_content for item in pipe.meta_repo.get_unclosed_events())
-    assert short in held and "然后呢" in held
+    assert short not in held and "然后呢" in held
 
     pipe.meta_repo.delete_unclosed_event("UC-short")
     for item in pipe.meta_repo.get_unclosed_events():
@@ -803,3 +803,81 @@ def test_date_anchor_locale_is_consistent():
     assert "Source statement date: 2024-06-01" in source_date_anchor(["2024-06-01"], "en")
     assert "不能折算" in source_date_anchor(["2024-06-01", "2024-06-03"], "zh")
     assert "ambiguous" in source_date_anchor(["2024-06-01", "2024-06-03"], "en")
+
+
+@pytest.mark.parametrize("force", [False, True])
+def test_time_guard_separates_four_day_fragments_even_if_model_merges(case, force):
+    pipe, _, llm = case
+    llm.push_response({"events": [{"indices": [1, 2]}], "residual": []})
+    a = MemoryExperience(subject_id="stone", text="Lee：明天去看展。", objects={"Lee":"lee"},
+                         source_ids=("time-a",), segment_id="time-a", occurred_at=datetime(2026, 1, 1, 17))
+    b = MemoryExperience(subject_id="stone", text="Lee：今天吃面。", objects={"Lee":"lee"},
+                         source_ids=("time-b",), segment_id="time-b", occurred_at=datetime(2026, 1, 5, 18))
+    if force:
+        # Public batch path below tests normal sealing; force path is separately exercised with pending lines.
+        lines = [UnclosedEvent(id="old", content_fragments=[a.text], buffer_items=[BufferSentence(
+            text=a.text, occurred_at=a.occurred_at, source_ids=a.source_ids)])]
+        events = pipe.metabolism_service._close_lines(lines, b.text, memory=b, input_id=None,
+            known_roles_hint=None, pre_role_entries=None)
+    else:
+        result = pipe.ingest_batch(MemoryBatch(subject_id="stone", experiences=(a,b)))
+        assert not result.errors
+        events = [pipe.event_repo.get(i) for i in result.sealed_event_ids]
+        prompt = llm.calls[0]["messages"][1]["content"]
+        assert "2026-01-01 17:00" in prompt and "2026-01-05 18:00" in prompt
+    assert len(events) == 2
+    assert all(not ("看展" in e.content_raw and "吃面" in e.content_raw) for e in events)
+    assert all(e.seal_reason == "truncated" for e in events)
+
+
+def test_old_short_residual_sealed_without_claiming_completion(case):
+    pipe, _, llm = case
+    llm.push_response({"events": [], "residual": [{"indices": [1, 2]}]})
+    result = pipe.ingest_batch(MemoryBatch(subject_id="stone", experiences=tuple(
+        MemoryExperience(subject_id="stone", text=text, source_ids=(str(i),), segment_id=str(i),
+                         occurred_at=datetime(2026,1,1+i))
+        for i,text in enumerate(["Lee：等检查结果。", "Lee：今天买菜。"]))))
+    assert not result.errors and len(result.sealed_event_ids) == 1
+    event = pipe.event_repo.get(result.sealed_event_ids[0])
+    assert event.content_raw == "Lee：等检查结果。" and event.seal_reason == "truncated"
+    assert "今天买菜" in pipe.meta_repo.get_shadow().content
+
+
+def test_time_cohorts_cross_midnight_unknown_and_aware():
+    from rems.utils.event_time import cohorts
+    dates = [datetime(2026,1,1,23,59), datetime(2026,1,2,0,1), None, datetime(2026,1,2,0,2)]
+    assert cohorts([BufferSentence(text="x", occurred_at=d) for d in dates],30,120) == [0,0,1,2]
+    local = datetime(2026,1,2,0,1).astimezone()
+    assert cohorts([BufferSentence(text="x", occurred_at=d) for d in [local,local.astimezone(timezone.utc)]],30,120) == [0,0]
+
+
+def test_refinement_related_group_can_cross_months_with_dates(case):
+    pipe, service, llm = case
+    a=small(pipe,"Lee：一月计划看展。",datetime(2026,1,1))
+    b=small(pipe,"Lee：四月取消计划。",datetime(2026,4,10))
+    llm.push_response({"events":[{"indices":[1,2]}],"residual":[]})
+    groups=service._groups([a,b])
+    assert groups == [[a,b]]
+    prompt=llm.calls[-1]["messages"][1]["content"]
+    assert "2026-01-01" in prompt and "2026-04-10" in prompt
+
+
+def test_representatives_keep_date_even_when_model_has_marker(case):
+    pipe, service, _=case
+    a=small(pipe,"Lee：明天看展。",datetime(2026,1,1))
+    parent=Event(content_raw=a.content_raw,summaries={"L1":f"〔#{a.memory_sequence}〕明天看展。"})
+    unit={"memory_sequence":a.memory_sequence}
+    service._keep_representatives(parent,[a],[unit],pipe.config.memory_refinement.stages[0])
+    assert "2026-01-01" in parent.summaries["L1"]
+
+
+def test_explicit_followup_can_cross_small_event_time_blocks(case):
+    pipe, _, llm = case
+    llm.push_response({"events":[{"indices":[1,2], "time_relation":"原话‘上次预约的检查结果出来了’明确回应‘等检查结果’，是同一检查的结果。"}], "residual":[]})
+    result=pipe.ingest_batch(MemoryBatch(subject_id="stone",experiences=tuple(
+        MemoryExperience(subject_id="stone",text=text,source_ids=(f"follow-{i}",),segment_id=f"follow-{i}",occurred_at=datetime(2026,1,1+i*4))
+        for i,text in enumerate(["Lee：等检查结果。","Lee：上次预约的检查结果出来了。"]))))
+    assert not result.errors and len(result.sealed_event_ids)==1
+    event=pipe.event_repo.get(result.sealed_event_ids[0])
+    assert "等检查结果" in event.content_raw and "出来了" in event.content_raw
+    assert event.event_time_start != event.event_time_end

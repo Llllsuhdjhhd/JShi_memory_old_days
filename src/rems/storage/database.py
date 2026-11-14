@@ -548,3 +548,8 @@ class Database:
             yield s
         finally:
             s.close()
+
+
+# Working prose is canonicalized on writes; original evidence stays in its own table.
+from ..utils.simplified_storage import install as _install_simplified_storage
+_install_simplified_storage(Base)

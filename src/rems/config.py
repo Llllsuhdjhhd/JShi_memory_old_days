@@ -35,6 +35,8 @@ class MemoryRefinementConfig(BaseModel):
     small_event_target_chars: int = Field(default=300, gt=0)
     small_event_max_chars: int = Field(default=500, gt=0)
     # 提炼时每条直接子事件补进 L1 的代表句上限。
+    small_event_gap_minutes: int = Field(default=30, gt=0)
+    small_event_span_minutes: int = Field(default=120, gt=0)
     representative_max_chars: int = Field(default=60, gt=0)
     max_batches_per_stage: int = Field(default=1, gt=0)
     interval_seconds: int = Field(default=3600, gt=0)

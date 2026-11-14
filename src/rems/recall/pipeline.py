@@ -580,7 +580,8 @@ class RecallPipeline:
         """
         # 档位不改变细节条数，避免调用方自动升降把明细带多。锚点不参与检索。
         del level, anchor_event_ids
-        q = (query or "").strip()
+        from ..utils.simplified_text import simplify_text
+        q = simplify_text((query or "").strip())
         if not _norm(q):
             return ()
 
@@ -751,6 +752,8 @@ class RecallPipeline:
 
     def index_event(self, event: Event) -> int:
         """L0 分块索引事件，或兼容旧 L1 事件与对象事实索引。"""
+        from ..utils.simplified_storage import canonicalize_event
+        canonicalize_event(event)
         if event.refinement_hidden_by:
             for key in self._vector_store.list_event_logical_ids(event.event_id):
                 self._vector_store.delete(key)

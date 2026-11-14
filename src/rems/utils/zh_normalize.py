@@ -97,5 +97,5 @@ def to_simplified(text: str) -> str:
 
 
 def normalize_for_substring_match(text: str) -> str:
-    """Lowercase + simplified form used as the haystack for role focus matching."""
-    return to_simplified(text).lower()
+    """Working text is already simplified; recall performs no OpenCC conversion."""
+    return text.lower()

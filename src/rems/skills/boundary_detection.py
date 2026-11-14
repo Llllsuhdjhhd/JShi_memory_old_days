@@ -35,6 +35,9 @@ class CompletedFragment(BaseModel):
     split_id: Optional[str] = None
     # 新协议：indices 已含来源线的句子，原文不再与旧线拼接一次。
     content_includes_source: bool = False
+    temporal_relation: str = ""
+    temporal_boundary: bool = False
+    temporal_incomplete: bool = False
 
 
 class NewUnclosed(BaseModel):
@@ -198,7 +201,16 @@ class BoundaryDetectionSkill:
         system_msg = build_user_mode_block(self._config) + (
             self._small_event_system() if lightweight else BOUNDARY_SYSTEM)
         if lightweight:
-            user_msg = "## Memory Buffer\n" + format_indexed_text(sentences)
+            if buffer_items is not None:
+                from ..utils.event_time import cohorts, label
+                items = [item for item in buffer_items if item.text]
+                policy = self._config.memory_refinement
+                blocks = cohorts(items, policy.small_event_gap_minutes, policy.small_event_span_minutes)
+                user_msg = "## Memory Buffer（时间段提示间隔，明确延续关系可跨段）\n" + "\n".join(
+                    f"[{i+1}] 时间段{blocks[i]+1}｜{label(item.occurred_at)}｜{item.text}"
+                    for i, item in enumerate(items))
+            else:
+                user_msg = "## Memory Buffer（时间未知，不推断连续发生）\n" + format_indexed_text(sentences)
 
         data = self._llm.complete_json(
             "boundary_detection",
@@ -207,7 +219,16 @@ class BoundaryDetectionSkill:
                 {"role": "user", "content": user_msg},
             ],
         )
-        return self.parse_response(data, sentences, shadow_count=0, formed_indices=set())
+        result = self.parse_response(data, sentences, shadow_count=0, formed_indices=set())
+        if lightweight:
+            relations = {}
+            for raw in data.get("events", []):
+                if isinstance(raw, dict) and isinstance(raw.get("time_relation"), str):
+                    indices = tuple(normalize_indices(raw.get("indices", [])))
+                    relations[indices] = raw["time_relation"].strip()
+            for fragment in result.completed_events:
+                fragment.temporal_relation = relations.get(tuple(fragment.source_indices), "")
+        return result
 
     def _small_event_system(self) -> str:
         policy = self._config.memory_refinement

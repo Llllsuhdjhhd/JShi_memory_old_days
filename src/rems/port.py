@@ -22,7 +22,7 @@ from .models.interlocutor import InterlocutorAttribution
 class MemoryExperience(BaseModel):
     """一段经历：统一所有记忆类型的载体。
 
-    - ``text`` 是原文，不归一化、不改写、不切分（输入层）；内部代谢切分是后端内部流程；
+    - ``text`` 的原始证据保全；工作副本在输入边界统一简体，不改写语义与来源；内部代谢切分是后端内部流程；
     - ``objects`` 为对象映射表（名字 / 称呼 → 01 object_id），覆盖一段经历涉及的对象，
       与是否说话、是否在文本中出现都无关；可为空（= 主体记忆）；
     - ``source_ids`` 来源链（事实 / 活动 / 认知 id），必带，保证来源可追溯；

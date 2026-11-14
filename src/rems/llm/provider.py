@@ -6,7 +6,8 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+from threading import Lock
 from pathlib import Path
 from typing import Any
 
@@ -15,9 +16,11 @@ from typing import Any
 from openai import OpenAI
 
 from ..config import REMSConfig
+from ..utils.simplified_text import simplify_data, simplify_text, LANGUAGE_RULE
 from .metrics import LLMInvocationMetrics
 
 logger = logging.getLogger(__name__)
+_SIMPLIFIED_ARCHIVE_LOCK = Lock()
 
 
 def _write_failed_llm_json(text: str) -> Path:
@@ -144,6 +147,7 @@ class LLMProvider:
         model: str | None = None,
         json_output: bool = False,
     ) -> str:
+        messages = [*messages, {"role":"system", "content":LANGUAGE_RULE}]
         resolved_model = model or self._get_model(task_type)
         temp = temperature if temperature is not None else self.config.llm.temperature
 
@@ -209,9 +213,21 @@ class LLMProvider:
             latency_ms,
             usage,
         )
-        return content
+        return content if json_output else simplify_text(content)
 
     # ------------------------------------------------------------------
+    def _canonical_json(self, raw):
+        parsed = self._extract_json(raw)
+        canonical = simplify_data(parsed)
+        if canonical != parsed:
+            from sqlalchemy.engine import make_url
+            database = make_url(self.config.storage.database_url).database
+            folder = Path(database).parent if database and database != ":memory:" else Path(os.environ.get("REMS_LOG_DIR", "logs"))
+            folder.mkdir(parents=True, exist_ok=True)
+            with _SIMPLIFIED_ARCHIVE_LOCK, (folder / "simplified-model-originals.jsonl").open("a", encoding="utf-8") as output:
+                output.write(json.dumps({"at": datetime.now(timezone.utc).isoformat(), "raw":raw}, ensure_ascii=False)+"\n")
+        return canonical
+
     def complete_json(
         self,
         task_type: str,
@@ -221,7 +237,7 @@ class LLMProvider:
         model: str | None = None,
     ) -> dict[str, Any]:
         raw = self.complete(task_type, messages, temperature=temperature if temperature is not None else 0.1, model=model, json_output=True)
-        return self._extract_json(raw)
+        return self._canonical_json(raw)
 
     def complete_json_continue(
         self,
@@ -236,7 +252,7 @@ class LLMProvider:
         messages.append({"role": "user", "content": new_user_content})
         raw = self.complete(task_type, messages, temperature=temperature if temperature is not None else 0.1, model=model, json_output=True)
         messages.append({"role": "assistant", "content": raw})
-        return self._extract_json(raw), messages
+        return self._canonical_json(raw), messages
 
     # ------------------------------------------------------------------
     @staticmethod

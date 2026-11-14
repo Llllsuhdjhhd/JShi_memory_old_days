@@ -51,15 +51,24 @@ class RefinementService:
         source_length = len("\n\n".join(self.source_text(event) for event in group))
         budget = max(1, int(source_length * stage.l1_retention_ratio))
         narrative = parent.summaries.get("L1", "")
+        from ..utils.event_time import label as time_label
+        representatives = {}
         additions: list[str] = []
         for event, unit in zip(group, units):
             label = self._sequence_label(event, unit)
             marker = f"〔#{label}〕"
-            sentence = self._representative_sentence(event, limit)
-            unit["representative"] = sentence
+            begin, end = time_span(event)
+            dates = time_label(begin) if begin == end else f"{time_label(begin)} 至 {time_label(end)}"
+            sentence = f"（{dates}）" + self._representative_sentence(event, limit)
+            if marker in narrative:
+                narrative = narrative.replace(marker, marker + f"（{dates}）")
+            representatives[marker] = f"{marker}{sentence}"
+            unit["representative"] = self._representative_sentence(event, limit)
             if marker not in narrative and all(not line.startswith(marker) for line in additions):
                 additions.append(f"{marker}{sentence}")
         if not additions:
+            parent.summaries = {**parent.summaries, "L1": narrative}
+            parent.summary_lengths = {**parent.summary_lengths, "L1": len(narrative)}
             missing = [f"〔#{self._sequence_label(event, unit)}〕" for event, unit in zip(group, units)]
             if any(marker not in narrative for marker in missing):
                 raise ValueError("Refinement L1 is missing a child sequence marker")
@@ -74,6 +83,10 @@ class RefinementService:
             # 代表句放不进剩余预算时，保留原摘要和代表句，并记下超出。
             text = (narrative.rstrip() + "\n" + extra) if narrative.strip() else extra
             overflow = len(text) > budget
+        for marker, representative in representatives.items():
+            if marker not in text:
+                text += "\n" + representative
+        overflow = len(text) > budget
         parent.summaries = {**parent.summaries, "L1": text}
         parent.summary_lengths = {**parent.summary_lengths, "L1": len(text)}
         return overflow
@@ -149,13 +162,20 @@ class RefinementService:
 
     def _groups(self, selected: list[Event]) -> list[list[Event]]:
         texts = [self.source_text(event) for event in selected]
-        units = "\n\n".join(f"[{index}] {text}" for index, text in enumerate(texts, 1))
+        from ..utils.event_time import label
+        units = "\n\n".join(
+            f"[{index}] 来源时间：{label(time_span(event)[0])} 至 {label(time_span(event)[1])}\n{text}"
+            for index, (event, text) in enumerate(zip(selected, texts), 1))
         data = self.llm.complete_json("boundary_detection", [
             {"role": "system", "content": (
                 "你是历史记忆事件形成组件。下面每个编号是一个已经保存的完整事件，"
                 "它们按经历时间连续选取，不是按相似主题聚类。复用闭合事件的形成原则，"
                 "将连续编号归为一个或几个适合提炼的事件组；允许将一段时期的多件经历"
                 "放在同一组，但不要编造它们的因果关系或概括成未经证明的长期偏好。"
+                "时间间隔不是禁止聚合的条件。确有同一事项、后续结果、变化过程或有意义的时期联系时，允许跨月跨年聚合；仅时间相邻或同有某个人名不足以证明联系。"
+                "不同日期是多次经历，必须保留时间先后，不可写成一次连续现场。"
+                "同主题不等于同一事件；先前计划、后来修改和实际结果要区分。"
+                "昨天、明天相对各自来源时间理解，未知日期不可补为今天。"
                 "每个原事件不可拆开，编号不可重复、不可改序。只输出 JSON："
                 '{"events":[{"indices":[1,2]}],"residual":[3]}。'
                 "没有最低字数要求；不能归入已形成组的完整编号留在 residual。"
@@ -245,13 +265,22 @@ class RefinementService:
                     cursor += len(text) + 2
                     for attr in event.interlocutor_attributions:
                         attrs[(attr.segment_id, attr.object_id)] = attr
+                from ..utils.event_time import label as time_label
                 parent = builder.seal_event(content, objects=objects, subject_id=subject_id,
                     source_ids=tuple(dict.fromkeys(ids)), occurred_at=start,
                     source_dates=list(dict.fromkeys(dates)),
                     interlocutor_attributions=list(attrs.values()),
                     refinement_stage=target, persist=False,
                     seal_reason="truncated" if any(e.seal_reason != "closed" for e in group) else "closed",
-                    source_context=json.dumps(units, ensure_ascii=False))
+                    source_context=json.dumps([
+                        {"ref": f"E{i+1}", "input_level": u["input_level"],
+                         "start_char": u["start_char"], "end_char": u["end_char"],
+                         "event_time_start": time_label(datetime.fromisoformat(u["event_time_start"])),
+                         "event_time_end": time_label(datetime.fromisoformat(u["event_time_end"])),
+                         "memory_sequence": u["memory_sequence"],
+                         "memory_sequence_start": u["memory_sequence_start"],
+                         "memory_sequence_end": u["memory_sequence_end"]}
+                        for i, u in enumerate(units)], ensure_ascii=False))
                 if not parent.summaries.get("L1", "").strip():
                     raise ValueError("Refinement produced no L1; sources remain visible")
                 overflow = self._keep_representatives(parent, group, units, stage)

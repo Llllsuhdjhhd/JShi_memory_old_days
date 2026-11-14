@@ -530,7 +530,8 @@ class MetabolismService:
         for fragment in result.completed_events:
             for chunk in groups(fragment.source_indices):
                 completed.append(CompletedFragment(content_raw=text(chunk), source_indices=chunk,
-                    content_includes_source=True, is_split_prefix=fragment.is_split_prefix))
+                    content_includes_source=True, is_split_prefix=fragment.is_split_prefix,
+                    temporal_relation=fragment.temporal_relation))
         for item in result.new_unclosed:
             chunks = groups(item.source_indices)
             for chunk in chunks[:-1]:
@@ -595,6 +596,58 @@ class MetabolismService:
         taken.add(new_id)
         return new_id
 
+    def _temporal_boundaries(self, result, buffer):
+        from ..utils.event_time import cohorts
+        from ..skills.boundary_detection import BoundaryResult, CompletedFragment, NewUnclosed
+        policy = self._config.memory_refinement
+        blocks = cohorts(buffer, policy.small_event_gap_minutes, policy.small_event_span_minutes)
+        if not blocks:
+            return result
+        last = blocks[-1]
+        output = BoundaryResult(disentangle=True)
+        claimed = set()
+        def parts(indices):
+            groups = {}
+            for i in sorted(set(indices)):
+                if 1 <= i <= len(buffer) and i not in claimed:
+                    groups.setdefault(blocks[i-1], []).append(i)
+                    claimed.add(i)
+            return groups
+        for fragment in result.completed_events:
+            if fragment.temporal_relation:
+                indices = [i for i in sorted(set(fragment.source_indices)) if 1 <= i <= len(buffer) and i not in claimed]
+                claimed.update(indices)
+                if indices:
+                    output.completed_events.append(fragment.model_copy(update={
+                        "content_raw": "\n".join(buffer[i-1].text for i in indices),
+                        "source_indices": indices, "temporal_boundary": True,
+                    }))
+                continue
+            groups = parts(fragment.source_indices)
+            for block, indices in groups.items():
+                output.completed_events.append(fragment.model_copy(update={
+                    "content_raw": "\n".join(buffer[i-1].text for i in indices),
+                    "source_indices": indices,
+                    "temporal_boundary": block != last or len(groups) > 1,
+                    "temporal_incomplete": len(groups) > 1,
+                }))
+        for fragment in result.new_unclosed:
+            for block, indices in parts(fragment.source_indices).items():
+                text = "\n".join(buffer[i-1].text for i in indices)
+                if block != last:
+                    output.completed_events.append(CompletedFragment(content_raw=text,
+                        source_indices=indices, temporal_boundary=True, temporal_incomplete=True))
+                else:
+                    output.new_unclosed.append(fragment.model_copy(update={"content": text, "source_indices": indices}))
+        for block, indices in parts(range(1, len(buffer)+1)).items():
+            if block != last:
+                output.completed_events.append(CompletedFragment(
+                    content_raw="\n".join(buffer[i-1].text for i in indices),
+                    source_indices=indices, temporal_boundary=True, temporal_incomplete=True))
+            else:
+                output.unclaimed_indices.extend(indices)
+        return output
+
     def _apply_disentangle(
         self,
         result: BoundaryResult,
@@ -607,6 +660,8 @@ class MetabolismService:
         force_save: bool = False,
     ) -> list[Event]:
         """按模型的句子分组封存。稳定编号由句子来源决定，不用模型的临时 id。"""
+        if self._config.memory_refinement.enabled:
+            result = self._temporal_boundaries(result, buffer)
         sealed: list[Event] = []
         sealed_idx: set[int] = set()
         residual_of: dict[int, str] = {}
@@ -660,14 +715,14 @@ class MetabolismService:
                 sealed.append(event)
                 sealed_idx.update(indices)
                 continue
-            if not force_save and not frag.is_split_prefix and not self._length_accepted(len(frag.content_raw)):
+            if not force_save and not frag.is_split_prefix and not frag.temporal_boundary and not self._length_accepted(len(frag.content_raw)):
                 residual_id = self._allocate_residual_id(indices, buffer, taken)
                 for index in indices:
                     residual_of[index] = residual_id
                 continue
             event = self._event_svc.seal_event(
                 frag.content_raw,
-                seal_reason="split" if frag.is_split_prefix else "closed",
+                seal_reason="truncated" if frag.temporal_incomplete else "split" if frag.is_split_prefix else "closed",
                 **self._seal_memory_kwargs(
                     memory,
                     content=frag.content_raw,
@@ -829,7 +884,7 @@ class MetabolismService:
             event = self._event_svc.seal_event(
                 content,
                 split_prefix_event_ids=inherited_prefix_chain or None,
-                seal_reason="split" if frag.is_split_prefix else "closed",
+                seal_reason="truncated" if frag.temporal_incomplete else "split" if frag.is_split_prefix else "closed",
                 **self._seal_memory_kwargs(
                     memory,
                     content=content,
@@ -975,6 +1030,8 @@ class MetabolismService:
         if semantic is None or not claimed:
             groups = [CompletedFragment(content_raw="", source_indices=list(range(1,len(buffer)+1)))]
         result = self._bound_groups(BoundaryResult(completed_events=groups, disentangle=True), buffer)
+        if self._config.memory_refinement.enabled:
+            result = self._temporal_boundaries(result, buffer)
         sealed = []
         for fragment in result.completed_events:
             selected = _buffer_items_for_content(fragment.content_raw, buffer, fragment.source_indices)

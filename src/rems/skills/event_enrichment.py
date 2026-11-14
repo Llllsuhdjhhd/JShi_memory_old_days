@@ -172,7 +172,8 @@ class EventEnrichmentSkill:
                          "序号用 provenance 里的 memory_sequence；没有单号时写 memory_sequence_start 到 "
                          "memory_sequence_end。人名用对象映射里的名字，数字和日期留在代表句中。"
                          "\nAnchor each relative date to its own source unit, never the refinement date. "
-                         "Do not merge different people's statements or different dates into one fact.")
+                         "Do not merge different people's statements or different dates into one fact. "
+                         "按日期或时期保留先后变化，明确原计划、后续修改及已发生结果；时间未知不补成当前时间。")
         data = self._llm.complete_json(
             "event_enrichment",
             [
