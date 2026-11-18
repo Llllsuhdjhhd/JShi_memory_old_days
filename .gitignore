@@ -14,6 +14,7 @@ chroma_data/
 _basetmp/
 *.so
 .venv/
+recent_memory/
 venv/
 
 # --- Simulation Data ---

@@ -25,6 +25,54 @@ from rems.pipeline import REMSPipeline  # noqa: E402
 from rems.port import RecalledFragment as RemsRecalledFragment  # noqa: E402
 
 
+def test_actual_jshi_control_keeps_cursor_on_dual_write_failure(config, fake_llm):
+    from jshi.experienceledger.inprocess import InProcessExperienceLedger
+    from jshi.experienceledger.port import ConsumerKind
+    from jshi.memorycontrol.inprocess import InProcessMemoryControl
+    from jshi.memory.rems3 import batch_payload, from_ingest_result
+    from rems.port import MemoryBatch
+    ledger = InProcessExperienceLedger()
+    ledger.append_external("stone", actor_object_id="lee", text_raw="维修费358元", objects={"甲": "lee"})
+    pipe = REMSPipeline.from_config(config, llm=fake_llm)
+    class Recent:
+        fails = True
+        def ingest_batch(self, batch):
+            if self.fails:
+                raise RuntimeError("recent unavailable")
+        def close(self):
+            pass
+    recent = Recent()
+    pipe.recent_memory = recent
+    class ActualAdapter:
+        def ingest_batch(self, batch):
+            return from_ingest_result(pipe.ingest_batch(MemoryBatch.model_validate(batch_payload(batch))))
+    control = InProcessMemoryControl(ledger, ActualAdapter(), flush_max_chars=1)
+    fake_llm.push_response({"events": [{"indices": [1]}], "residual": []})
+    fake_llm.push_response({"summaries": {"L1": "维修费358元"}, "objects": []})
+    try:
+        failed = control.run_once("stone")
+        assert failed.status == "failed"
+        assert ledger.consumer_cursor("stone", ConsumerKind.MEMORY) == 0
+        assert len(pipe.event_repo.list_all()) == 1
+        recent.fails = False
+        retried = control.run_once("stone")
+        assert retried.status == "ingested"
+        assert ledger.consumer_cursor("stone", ConsumerKind.MEMORY) == 1
+        assert len(pipe.event_repo.list_all()) == 1
+    finally:
+        pipe.close()
+
+
+def test_jshi_adapter_accepts_native_recent_fragment_without_interface_changes():
+    raw = RemsRecalledFragment(event_id="mem0:example", text="原话358元",
+        content="〔近期原文〕原话358元", kind="recent", source_ids=["source-1"],
+        summary_level="raw", representation_level="raw", interlocutor="OBJ-A",
+        interlocutor_object_ids=["OBJ-A"])
+    (mapped,) = from_recalled_fragments((raw,))
+    assert mapped.event_id == "mem0:example"
+    assert "358" in mapped.content and "source-1" in mapped.source_ids
+
+
 def test_rems_pipeline_accepts_all_current_jshi_recall_arguments():
     jshi_parameters = set(inspect.signature(JshiMemoryPort.recall).parameters) - {"self"}
     rems_parameters = set(inspect.signature(REMSPipeline.recall).parameters)

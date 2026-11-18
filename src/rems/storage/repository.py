@@ -985,6 +985,18 @@ class StoredMarksRepository:
             r = s.get(StoredMarkRecord, input_id)
             return list(r.event_ids or []) if r else None
 
+    def get_many(self, subject_id: str, input_ids) -> dict[str, list[str]]:
+        """Recover only this retry's receipts without scanning the full ledger."""
+        identities = sorted(x for x in set(input_ids) if x)
+        result = {}
+        with self._db.session() as s:
+            for offset in range(0, len(identities), 500):
+                rows = s.query(StoredMarkRecord).filter(
+                    StoredMarkRecord.subject_id == subject_id,
+                    StoredMarkRecord.input_id.in_(identities[offset:offset + 500])).all()
+                result.update((r.input_id, list(r.event_ids or [])) for r in rows)
+        return result
+
     def list_all(self, subject_id: str | None = None) -> list[dict]:
         with self._db.session() as s:
             q = s.query(StoredMarkRecord)

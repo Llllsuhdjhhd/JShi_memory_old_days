@@ -22,7 +22,8 @@ class RefinementStage(BaseModel):
 
 
 class MemoryRefinementConfig(BaseModel):
-    enabled: bool = True
+    # 本分支默认使用完整长事件；小事件与定龄提炼仅保留为显式可选模式。
+    enabled: bool = False
     stages: list[RefinementStage] = Field(default_factory=lambda: [
         RefinementStage(age_days=90), RefinementStage(age_days=365),
     ])
@@ -67,6 +68,31 @@ class RecallDetailConfig(BaseModel):
     min_similarity: float | None = Field(default=None, ge=0, le=1)
     # 上层事件和附上的原文使用同一种日期锚点。zh 为真实使用的默认写法，en 供英文评测。
     date_anchor_locale: Literal["zh", "en"] = "zh"
+
+
+class RecentMemoryConfig(BaseModel):
+    """Mem0 native storage/search; REMS only supplies contracts and retention policy."""
+    enabled: bool = True
+    process_isolation: bool = True
+    path: str | None = None  # Default: beside the long-term SQLite database.
+    retention_days: int = Field(default=365, gt=0)
+    max_bytes: int = Field(default=10_000_000_000, gt=0)
+    cleanup_trigger_bytes: int = Field(default=8_000_000_000, gt=0)
+    cleanup_target_bytes: int = Field(default=7_000_000_000, gt=0)
+    cleanup_batch_size: int = Field(default=256, gt=0)
+    maintenance_interval_seconds: int = Field(default=3600, gt=0)
+    search_limit: int = Field(default=20, gt=0)
+    search_threshold: float = Field(default=0.2, ge=0, le=1)
+    embedding_dims: int = Field(default=512, gt=0)
+    embedder: dict | None = None  # Mem0's native provider/config, no custom implementation.
+    reranker: dict | None = None  # Optional Mem0 native provider/config.
+    rerank_candidate_limit: int = Field(default=100, gt=0)
+
+    @model_validator(mode="after")
+    def validate_watermarks(self):
+        if not self.cleanup_target_bytes < self.cleanup_trigger_bytes < self.max_bytes:
+            raise ValueError("recent memory requires target < trigger < max bytes")
+        return self
 
 
 class UserMode(str, Enum):
@@ -130,6 +156,8 @@ class EmbeddingConfig(BaseModel):
     provider: str = "local"
     model_name: str = "BAAI/bge-small-zh-v1.5"
     query_instruction: str = ""
+    # Explicit runtime placement; installing CUDA must not silently change a CPU profile.
+    device: str = "cpu"
     api_base_url: str | None = None
     api_key: str | None = None
 
@@ -198,6 +226,7 @@ class REMSConfig(BaseSettings):
     llm: LLMConfig = Field(default_factory=LLMConfig)
     embedding: EmbeddingConfig = Field(default_factory=EmbeddingConfig)
     storage: StorageConfig = Field(default_factory=StorageConfig)
+    recent_memory: RecentMemoryConfig = Field(default_factory=RecentMemoryConfig)
     tier1: Tier1Config = Field(default_factory=Tier1Config)
     tri_band: TriBandConfig = Field(default_factory=TriBandConfig)
     lifecycle: LifecycleConfig = Field(default_factory=LifecycleConfig)
@@ -290,8 +319,15 @@ class REMSConfig(BaseSettings):
     recall_relevance_close: float = 0.08
     # 嵌入模型或维度变更时递增。物理集合名会带上这个版本，旧集合不覆盖。
     recall_embedding_version: int = 1
-    # 原文用于寻找事件；压缩层仍用于取回后的预算选级。L1 保留作对照。
-    recall_event_index_level: Literal["L0", "L1"] = "L0"
+    # 长期默认以 L1 建向量索引，保留 L0 存储与词面回查。
+    recall_event_index_level: Literal["L0", "L1"] = "L1"
+    recall_rerank_enabled: bool = True
+    recall_rerank_model: str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+    recall_rerank_onnx_file: str | None = "onnx/model_quint8_avx2.onnx"
+    recall_rerank_threads: int = Field(default=4, ge=1, le=64)
+    recall_rerank_device: str = "cpu"
+    recall_rerank_pool: int = Field(default=100, gt=0)
+    recall_rerank_top_n: int = Field(default=6, ge=2)
     # 上层事件被选中后，摘要缺少的查询词才附到同一条结果。档位不参与。
     recall_detail: RecallDetailConfig = Field(default_factory=RecallDetailConfig)
 
@@ -363,13 +399,13 @@ class REMSConfig(BaseSettings):
     # 兼容旧环境变量；逻辑已废弃，勿再依赖。
     unclosed_idle_hours: float = 1.0
     # 立即封存的原文字数门槛（资源目标，不是事件的语义尺度）。
-    # 常见工作尺度暂定约 800–1000 字，有弹性，鼓励偏长；本默认取区间中部。
+    # 正常封存使用约 2000–3000 字的完整语义事件；上界由 event_len_factor 给出。
     # 短于该值的已形成事件仍是事件，可在形成窗口多留一些时间等待扩写或结束等待。
-    # 0 = 不设门槛，当轮封存。模型不看这个数。可用 REMS_EVENT_MIN_CHARS 覆盖。
-    event_min_chars: int = 900
+    # 0 = 不设门槛；长事件边界提示词使用此尺度。可用 REMS_EVENT_MIN_CHARS 覆盖。
+    event_min_chars: int = 2000
     # 事件工作尺度 ev_len 的上限倍数。模型在 [ev_len, k·ev_len) 内取最接近 ev_len 的闭合。
     # ev_len 使用 event_min_chars。0 表示不设尺度，模型标成事件的都封存。
-    event_len_factor: float = 2.0
+    event_len_factor: float = 1.5
     # ---- 80/20 Forced Split (2026-05, 白皮书 4.2 升级) ----
     # 评估到 oversized_uc 后，OverlongUCSplitSkill 的目标切分比例与可接受区间。
     # 切点仍由模型基于"逻辑闭环"选择，此处只给数量级指引。

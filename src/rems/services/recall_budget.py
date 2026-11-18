@@ -57,7 +57,7 @@ class RecallBudgetManager:
         ``items`` 为本回忆的候选（事件/人物肖像），每条需有 ``score``（评分/重要性）与内容文本。
         返回 ``[{fragment, level, budget, used}]``，其中 ``budget`` 为该级字数上限，``used``=实际截断长度。
         """
-        budget = budget or self.budget_chars()
+        budget = self.budget_chars() if budget is None else budget
         budgets = self.level_budgets()
         # 从最长级(L{count}) 到最短级(L1) 排序
         desc = sorted(budgets.items(), key=lambda kv: kv[1], reverse=True)
@@ -68,6 +68,12 @@ class RecallBudgetManager:
         for item in ranked:
             text = getattr(item, "content", None) or getattr(item, "text", None) or ""
             clen = len(text)
+            if getattr(item, "kind", None) == "recent":
+                # Mem0 raw evidence stays whole even through legacy block assembly.
+                if clen <= remaining:
+                    selected.append({"fragment": item, "level": "raw", "budget": clen, "used": clen})
+                    remaining -= clen
+                continue
             chosen = None
             for level, cap in desc:
                 use = min(cap, clen)          # 实际展示字数 = 档位上限 与 内容长度 的较小值

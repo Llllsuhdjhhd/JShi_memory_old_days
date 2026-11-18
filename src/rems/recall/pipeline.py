@@ -381,6 +381,7 @@ class RecallPipeline:
         rrf_k: int = 60,
         top_k: int = 60,
         rerank_top_n: int = 20,
+        rerank_pool: int = 100,
         half_life_days: float = 60.0,
         silence_threshold: float = 0.02,
         reinforce_multiplier: float = 1.5,
@@ -428,6 +429,7 @@ class RecallPipeline:
         self._rrf_k = rrf_k
         self._top_k = top_k
         self._rerank_top_n = rerank_top_n
+        self._rerank_pool = rerank_pool
         self._half_life_days = half_life_days
         self._silence_threshold = silence_threshold
         self._reinforce_multiplier = reinforce_multiplier
@@ -513,11 +515,13 @@ class RecallPipeline:
         """
         semantic: dict[tuple[str, str, str], float] = {}
         ids: list[str] = []
+        complete_pool: list = []
         if use_semantic and query_vector is not None:
             semantic = self._semantic_signals(
                 subject_id, query, wanted, time_range,
                 query_vector=query_vector,
                 top_k=self._candidate_vector_k,
+                complete_pool_sink=complete_pool,
             )
             ids.extend(key[1] for key in semantic)
         if use_lexical and self._candidate_lexical_k > 0:
@@ -549,6 +553,7 @@ class RecallPipeline:
                     query_vector=query_vector,
                     event_ids=tuple(missing),
                     top_k=len(missing),
+                    prefetched_hits=complete_pool[0] if complete_pool else None,
                 )
                 for key, score in extra.items():
                     semantic.setdefault(key, score)
@@ -709,6 +714,7 @@ class RecallPipeline:
                 interlocutor_object_id=interlocutor_object_id,
                 use_semantic=use_semantic, use_lexical=use_lexical,
                 recent_event_ids=recent_event_ids, fact_entries=fact_entries, lexical_fn=lexical,
+                raw_lookup=expand_raw,
             ))
         candidates.extend(self._unclosed_candidates(
             subject_id, q, wanted, time_range,
@@ -719,6 +725,13 @@ class RecallPipeline:
         ordered = self._arrange(admitted, wanted, close=0.0 if small_library else None)
         if recent_event_ids and not small_library:
             ordered = self._reserve_recent_candidate(ordered, wanted)
+        if self._reranker is not None:
+            from .ranking import rerank_candidates
+            try:
+                ordered = rerank_candidates(q, ordered, self._reranker,
+                    pool_size=self._rerank_pool, top_n=self._rerank_top_n)
+            except Exception:
+                logger.exception("Long-term reranking failed; keeping retrieval order")
         fragments = self._fill_budget(
             ordered, budget, expand_raw=expand_raw, limit=limit,
             candidate_sink=candidate_sink, candidate_call=candidate_call,
@@ -766,10 +779,15 @@ class RecallPipeline:
         )))
         pending: list[tuple[str, str, dict]] = []
         desired: set[str] = set()
-        l1 = retrieval_text(event, self._event_index_level)
+        index_level = self._event_index_level
+        # Old small-event databases legitimately have no L1. Preserve semantic
+        # access during cutover without fabricating a summary or re-ingesting.
+        if index_level == "L1" and not _level_text(event.summaries, "L1"):
+            index_level = "L0"
+        l1 = retrieval_text(event, index_level)
         if l1:
             splitter = getattr(self._embedding, "split_document", None)
-            chunks = splitter(l1) if splitter and self._event_index_level == "L0" else [l1]
+            chunks = splitter(l1) if splitter and index_level == "L0" else [l1]
             for index, chunk in enumerate(chunks):
                 logical_id = event.event_id if index == 0 else f"{event.event_id}#raw#{index}"
                 desired.add(logical_id)
@@ -778,6 +796,7 @@ class RecallPipeline:
                     object_ids=event_object_ids, text=chunk,
                 )
                 payload["chunk_index"] = index
+                payload["representation_level"] = index_level
                 if not self._index_unchanged(logical_id, payload):
                     pending.append((logical_id, chunk, payload))
         else:
@@ -950,6 +969,8 @@ class RecallPipeline:
         query_vector: list[float] | None = None,
         event_ids: tuple[str, ...] | None = None,
         top_k: int | None = None,
+        complete_pool_sink: list | None = None,
+        prefetched_hits: list | None = None,
     ) -> dict[tuple[str, str, str], float]:
         if event_ids is not None and not event_ids:
             return {}
@@ -967,14 +988,25 @@ class RecallPipeline:
             "embedding_version": self._embedding_version,
         }
         wanted_filter = {"object_ids": list(wanted)} if wanted else {}
-        hits = self._vector_store.search(
+        complete_search = getattr(self._vector_store, "search_complete", None)
+        if complete_pool_sink is not None and callable(complete_search):
+            prefetched_hits = complete_search(vector, payload_filter=payload_filter,
+                any_of=wanted_filter or None, ranges=ranges)
+            if prefetched_hits is not None:
+                complete_pool_sink.append(prefetched_hits)
+        if prefetched_hits is not None:
+            allowed = set(event_ids) if event_ids is not None else None
+            hits = [hit for hit in prefetched_hits if allowed is None or
+                    (hit.get("payload") or {}).get("event_id") in allowed][:limit]
+        else:
+            hits = self._vector_store.search(
             vector,
             top_k=limit,
             payload_filter=payload_filter,
             any_of=wanted_filter or None,
             ranges=ranges,
         )
-        if event_ids is not None and len(hits) >= limit:
+        if prefetched_hits is None and event_ids is not None and len(hits) >= limit:
             # qdrant-local evaluates a MatchAny list once per stored point, so a
             # list as long as the library costs O(points x events). Only apply the
             # id filter when the unfiltered search was actually truncated; if it
@@ -1022,6 +1054,7 @@ class RecallPipeline:
         recent_event_ids: set[str],
         fact_entries=None,
         lexical_fn=lexical_score,
+        raw_lookup=False,
     ) -> list[_Candidate]:
         access = self._effective_factor(ev, now)
         temporal = 1.0 if time_range is not None else None
@@ -1044,6 +1077,8 @@ class RecallPipeline:
         lexical_parts = [ev.content_raw or ""] if ev.memory_stage == 0 else [
             "\n".join(levels.values()), *[text for _leaf_id, text in raws],
         ]
+        if raw_lookup:
+            lexical_parts.append(ev.content_raw or "")
         lexical = 0.0
         if use_lexical:
             lexical = max(
@@ -1275,7 +1310,8 @@ class RecallPipeline:
             else:
                 picked = select_representation(
                     cand.levels, cand.raw, remaining - len(date_note),
-                    expand_raw=expand_raw or bool(cand.event and cand.event.memory_stage == 0),
+                    expand_raw=expand_raw or bool(cand.event and (
+                        cand.event.memory_stage == 0 or not any(cand.levels.values()))),
                 )
             if picked is None:
                 record(rank, cand, selected=False, reason="no_room")

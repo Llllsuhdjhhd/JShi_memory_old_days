@@ -226,6 +226,7 @@ def test_real_jshi_core_receives_only_assembled_memory(tmp_path):
     from datetime import datetime
 
     cfg = REMSConfig(_env_file=None, subject_id=SUBJECT,
+        recent_memory={"enabled": False},
         embedding={"provider": "hash"}, storage={"database_url": "sqlite:///" + (tmp_path/"memory.db").as_posix()},
         llm={"api_key": "offline-test"})
     class FakeLLM(LLMProvider):

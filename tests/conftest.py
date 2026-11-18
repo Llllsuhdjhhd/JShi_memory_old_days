@@ -15,16 +15,23 @@ def tmp_dir(tmp_path):
 @pytest.fixture
 def config(tmp_dir):
     cfg = REMSConfig()
-    # Existing fixtures exercise the pre-refinement full-event path.
-    # New refinement tests explicitly enable the production-default lifecycle.
+    cfg.recent_memory.enabled = False
+    cfg.recall_event_index_level = "L0"  # Preserve existing single-store regression cases.
+    # Full events are the default; refinement tests explicitly enable that mode.
     cfg.memory_refinement.enabled = False
+    # Client-construction tests must work without a developer's private .env.
+    cfg.llm.api_key = "offline-test"
+    cfg.llm.base_url = "http://127.0.0.1:9/v1"
     cfg.storage.database_url = f"sqlite:///{tmp_dir}/test.db"
     cfg.storage.qdrant_url = ":memory:"
     cfg.embedding.provider = "hash"  # Use deterministic hash to avoid downloading models
+    cfg.recent_memory.process_isolation = False
     cfg.recall_query_compress_enabled = False
     cfg.ingest_llm_session_enabled = False
-    # 生产默认约 900 字才立即封存。既有单测用短文本，并断言当轮封存。
+    # 生产默认 2000 字才正常封存。既有单测用短文本，并断言当轮封存。
     cfg.event_min_chars = 0
+    # Legacy fixture cases that set a length assume the historical factor of two.
+    cfg.event_len_factor = 2.0
     return cfg
 
 @pytest.fixture

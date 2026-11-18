@@ -23,8 +23,11 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     global _pipeline
     config = REMSConfig()
     _pipeline = REMSPipeline.from_config(config)
-    yield
-    _pipeline = None
+    try:
+        yield
+    finally:
+        _pipeline.close()
+        _pipeline = None
 
 
 def create_app() -> FastAPI:
