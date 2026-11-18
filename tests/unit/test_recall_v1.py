@@ -349,7 +349,7 @@ def test_multiple_topic_details_outweigh_a_shared_name():
     assert lexical_score(query, relevant) > lexical_score(query, unrelated)
 
 
-def test_missing_l1_does_not_embed_raw(db):
+def test_missing_l1_keeps_raw_semantic_access_for_legacy_events(db):
     embedding = _CountingEmbedding()
     store = QdrantRecallVectorStore("events", url=":memory:")
     event_repo = EventRepository(db)
@@ -357,8 +357,8 @@ def test_missing_l1_does_not_embed_raw(db):
     ev = Event(content_raw="只有原文，没有 L1", subject_id="jshi-1", summaries={})
     event_repo.save(ev)
     pipe.index_event(ev)
-    assert embedding.docs == 0
-    assert store.get(ev.event_id) is None
+    assert embedding.docs == 1
+    assert store.get(ev.event_id)["representation_level"] == "L0"
 
 
 def test_vector_search_respects_object_and_time(recall_pipeline):

@@ -78,9 +78,10 @@ class HashEmbedding:
 class SentenceTransformerEmbedding:
     """本地 sentence-transformers 嵌入（bge-base-zh / BGE-M3 等）。"""
 
-    def __init__(self, model_name: str, query_instruction: str = ""):
+    def __init__(self, model_name: str, query_instruction: str = "", *, device: str = "cpu"):
         self._model_name = model_name
         self._query_instruction = query_instruction
+        self._device = device
         self._model = None
         self._lock = threading.Lock()
 
@@ -88,7 +89,7 @@ class SentenceTransformerEmbedding:
         if self._model is None:
             from sentence_transformers import SentenceTransformer
 
-            self._model = SentenceTransformer(self._model_name)
+            self._model = SentenceTransformer(self._model_name, device=self._device)
 
     def embed_documents(self, texts: Sequence[str]) -> list[list[float]]:
         with self._lock:
@@ -143,26 +144,59 @@ class NullReranker:
 
 
 class BgeReranker:
-    """本地 bge-reranker cross-encoder 精排。"""
+    """Local cross-encoder; model choice is configurable, weights stay local."""
 
-    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3"):
+    def __init__(self, model_name: str = "BAAI/bge-reranker-v2-m3", *,
+                 onnx_file: str | None = None, threads: int = 4, device: str = "cpu"):
+        if not 1 <= threads <= 64:
+            raise ValueError("Reranker threads must be between 1 and 64")
+        if onnx_file and device != "cpu":
+            raise ValueError("CPU ONNX weights require device=cpu; clear onnx_file for CUDA PyTorch")
         self._model_name = model_name
+        self._onnx_file = onnx_file
+        self._threads = threads
+        self._device = device
         self._model = None
+        self._tokenizer = None
         self._lock = threading.Lock()
 
     def _ensure(self):
         if self._model is None:
+            if self._onnx_file:
+                from huggingface_hub import hf_hub_download
+                from transformers import AutoTokenizer
+                import onnxruntime as ort
+                path = hf_hub_download(self._model_name, self._onnx_file, local_files_only=True)
+                options = ort.SessionOptions()
+                options.intra_op_num_threads = self._threads
+                options.inter_op_num_threads = 1
+                options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+                options.add_session_config_entry("session.inter_op.allow_spinning", "0")
+                self._model = ort.InferenceSession(path, sess_options=options,
+                    providers=["CPUExecutionProvider"])
+                self._tokenizer = AutoTokenizer.from_pretrained(self._model_name, local_files_only=True)
+                return
             from sentence_transformers import CrossEncoder
+            import torch
 
-            self._model = CrossEncoder(self._model_name)
+            self._model = CrossEncoder(self._model_name, local_files_only=True,
+                device=self._device, max_length=512, activation_fn=torch.nn.Identity())
 
     def rerank(self, query: str, candidates: Sequence[str]) -> list[float]:
         if not candidates:
             return []
         with self._lock:
             self._ensure()
+            if self._onnx_file:
+                # Official exported cross-encoder; only tokenization and native
+                # ONNX inference here. Raw logits preserve the ranking order.
+                encoded = self._tokenizer([query]*len(candidates), list(candidates),
+                    padding=True, truncation=True, max_length=512, return_tensors="np")
+                names = {item.name for item in self._model.get_inputs()}
+                scores = self._model.run(None, {k:v for k,v in encoded.items() if k in names})[0]
+                return [float(row[0]) for row in scores]
             pairs = [(query, c) for c in candidates]
-            scores = self._model.predict(pairs)
+            scores = self._model.predict(pairs, batch_size=8, show_progress_bar=False)
             return [float(s) for s in scores]
 
 
@@ -187,6 +221,8 @@ class QdrantRecallVectorStore:
             self._client = QdrantClient(":memory:")
         self._collection = collection
         self._dim: int | None = None
+        self._local = bool(path) or not url or url == ":memory:"
+        self._uniform_payload = None
         # 同实例并发 upsert/search：本地 Qdrant 无细粒度内部锁，窄锁保护。
         self._lock = threading.RLock()
 
@@ -218,6 +254,7 @@ class QdrantRecallVectorStore:
 
     def upsert(self, event_id: str, vector: list[float], payload: dict) -> None:
         with self._lock:
+            self._uniform_payload = None
             from qdrant_client import models
 
             self._ensure_collection(len(vector))
@@ -296,6 +333,7 @@ class QdrantRecallVectorStore:
             from qdrant_client import models
 
             self._ensure_collection(len(vector))
+            payload_filter = self._effective_filter(payload_filter)
             conditions = []
             for key, value in (payload_filter or {}).items():
                 conditions.append(models.FieldCondition(
@@ -347,8 +385,50 @@ class QdrantRecallVectorStore:
                 ]
             return hits
 
+    def _effective_filter(self, payload_filter):
+        """Elide proven constant filters only on this exclusively owned local DB.
+
+        Qdrant local evaluates metadata predicates in Python. Uniform subject /
+        model / version constraints are tautologies. Verify once from native
+        payloads, invalidate on every mutation, never assume this for a server.
+        """
+        if not self._local or not payload_filter:
+            return payload_filter
+        if self._uniform_payload is None:
+            keys = ("subject_id", "embedding_model", "embedding_version")
+            uniform = None
+            offset = None
+            while True:
+                rows, offset = self._client.scroll(self._collection, limit=512, offset=offset,
+                    with_payload=list(keys), with_vectors=False)
+                for row in rows:
+                    values = {k: row.payload[k] for k in keys if k in (row.payload or {})}
+                    uniform = values if uniform is None else {
+                        k:v for k,v in uniform.items() if k in values and v == values[k]}
+                if offset is None:
+                    break
+            self._uniform_payload = uniform or {}
+        return {k:v for k,v in payload_filter.items()
+                if k not in self._uniform_payload or self._uniform_payload[k] != v}
+
+    def search_complete(self, vector, *, payload_filter=None, any_of=None,
+                        ranges=None, max_points=4096):
+        """One exact native search for a small index; None means use top-K.
+
+        The lock covers count and query, so a concurrent upsert cannot make a
+        truncated pool look complete. No vectors or results survive this call.
+        """
+        with self._lock:
+            self._ensure_collection(len(vector))
+            count = self._client.get_collection(self._collection).points_count
+            if count is None or count > max_points:
+                return None
+            return self.search(vector, top_k=max(1, count),
+                payload_filter=payload_filter, any_of=any_of, ranges=ranges)
+
     def delete(self, event_id: str) -> None:
         with self._lock:
+            self._uniform_payload = None
             try:
                 if not self._client.collection_exists(self._collection):
                     return

@@ -137,11 +137,12 @@ class EventService:
                         and (not source_fragment_ids or previous.source_fragment_ids == source_fragment_ids)):
                     return previous
 
+        # Both full events and lightweight events retain their source interval.
+        dates = source_dates or ([occurred_at.isoformat()] if occurred_at else [])
+        moments = [datetime.fromisoformat(value) for value in dates]
+        from datetime import timezone
+        key = lambda value: value.replace(tzinfo=timezone.utc).timestamp() if value.tzinfo is None else value.timestamp()
         if lightweight:
-            dates = source_dates or ([occurred_at.isoformat()] if occurred_at else [])
-            moments = [datetime.fromisoformat(value) for value in dates]
-            from datetime import timezone
-            key = lambda value: value.replace(tzinfo=timezone.utc).timestamp() if value.tzinfo is None else value.timestamp()
             moment = occurred_at or datetime.now(timezone.utc)
             event = Event(content_raw=content_raw, subject_id=subject_id,
                 source_ids=list(source_ids), source_fragment_ids=list(source_fragment_ids or []),
@@ -297,7 +298,9 @@ class EventService:
             source_fragment_ids=list(source_fragment_ids or []),
             occurred_at=occurred_at,
             summaries=enrichment.summaries,
-            source_dates=source_dates or ([occurred_at.isoformat()] if occurred_at else []),
+            source_dates=dates,
+            event_time_start=min(moments, key=key, default=occurred_at),
+            event_time_end=max(moments, key=key, default=occurred_at),
             summary_lengths=enrichment.summary_lengths,
             actual_max_level=enrichment.actual_max_level,
             role_list=resolved_role_entries,

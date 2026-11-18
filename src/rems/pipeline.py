@@ -10,6 +10,9 @@ from __future__ import annotations
 
 import logging
 import uuid
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 from .config import REMSConfig
@@ -61,6 +64,13 @@ from .strategies.event_weight import EventWeightDeriver
 logger = logging.getLogger(__name__)
 
 
+class MemoryIngestError(RuntimeError):
+    """Retryable dual-write failure. JShi retries exceptions, not errors lists."""
+    def __init__(self, result: BackendIngestResult):
+        self.result = result
+        super().__init__("; ".join(result.errors))
+
+
 class REMSPipeline:
     """记忆写入 + 回忆读取双端口编排。"""
 
@@ -83,6 +93,7 @@ class REMSPipeline:
         recall_trace_repo: RecallTraceRepository | None = None,
         portrait_service: PortraitService | None = None,
         recall_budget: RecallBudgetManager | None = None,
+        recent_memory=None,
     ):
         self.config = config
         self.llm = llm
@@ -105,6 +116,10 @@ class REMSPipeline:
         self.recall_trace_repo = recall_trace_repo
         self.portrait_service = portrait_service
         self.recall_budget = recall_budget
+        self.recent_memory = recent_memory
+        self._ingest_lock = threading.RLock()
+        self.last_recall_errors: list[str] = []
+        self.last_ingest_timings: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     @classmethod
@@ -138,7 +153,8 @@ class REMSPipeline:
             embedding = HashEmbedding()
         else:
             embedding = SentenceTransformerEmbedding(
-                config.embedding.model_name, config.embedding.query_instruction
+                config.embedding.model_name, config.embedding.query_instruction,
+                device=config.embedding.device,
             )
         vector_store = QdrantRecallVectorStore(
             versioned_collection_name(
@@ -150,8 +166,9 @@ class REMSPipeline:
             url=config.storage.qdrant_url,
             path=config.storage.qdrant_path,
         )
-        # reranker 默认 Null（纯 RRF）；启用时换 BgeReranker（见配置项，后续接入）。
-        reranker: BgeReranker | NullReranker = NullReranker()
+        reranker = (BgeReranker(config.recall_rerank_model, onnx_file=config.recall_rerank_onnx_file,
+                              threads=config.recall_rerank_threads, device=config.recall_rerank_device)
+            if config.recall_rerank_enabled and config.embedding.provider != "hash" else None)
         intent_classifier = RuleIntentClassifier(
             entity_lexicon=config.recall_intent_entity_lexicon,
             emotion_lexicon=config.recall_intent_emotion_lexicon,
@@ -163,6 +180,8 @@ class REMSPipeline:
             event_repo,
             object_timeline_repo,
             reranker=reranker,
+            rerank_top_n=config.recall_rerank_top_n,
+            rerank_pool=config.recall_rerank_pool,
             intent_classifier=intent_classifier,
             rrf_k=config.recall_rrf_k,
             half_life_days=config.recall_access_half_life_days,
@@ -241,6 +260,11 @@ class REMSPipeline:
         )
         belief_revision_service = BeliefRevisionService(config, event_repo, role_repo)
 
+        from .services.recent_memory import Mem0RecentMemory
+        from .services.recent_process import Mem0RecentProcess
+        recent_cls = Mem0RecentProcess if config.recent_memory.process_isolation else Mem0RecentMemory
+        recent_memory = recent_cls(config) if config.recent_memory.enabled else None
+
         return cls(
             config=config,
             llm=llm,
@@ -258,6 +282,7 @@ class REMSPipeline:
             recall_trace_repo=recall_trace_repo,
             portrait_service=portrait_service,
             recall_budget=recall_budget,
+            recent_memory=recent_memory,
         )
 
     # ------------------------------------------------------------------
@@ -274,6 +299,71 @@ class REMSPipeline:
                                      subject_id or self.config.subject_id, now)
 
     def ingest_batch(self, batch: MemoryBatch) -> BackendIngestResult:
+        """Independent parallel writes; only long-term event IDs acknowledge JShi."""
+        import hashlib
+        if any(e.subject_id != batch.subject_id for e in batch.experiences):
+            if self.recent_memory is not None:
+                raise ValueError("Mixed subjects in memory batch")
+            return BackendIngestResult(subject_id=batch.subject_id,
+                errors=["Mixed subjects in memory batch"])
+        if self.recent_memory is not None:
+            # JShi sends empty placeholders for non-delivered/non-memory rows.
+            # These are valid no-ops, unlike storage/model/index failures.
+            batch = batch.model_copy(update={"experiences": tuple(
+                e for e in batch.experiences if e.text.strip())})
+        # Stable fallback IDs also make anonymous retries safe for both stores.
+        batch = batch.model_copy(update={"experiences": tuple(
+            e if e.segment_id else e.model_copy(update={"segment_id": "auto:" +
+                hashlib.sha256(e.model_dump_json().encode()).hexdigest()})
+            for e in batch.experiences)})
+        with self._ingest_lock:
+            timings = {}
+            started = time.perf_counter()
+            def measured(name, operation):
+                begin = time.perf_counter()
+                try:
+                    return operation(batch)
+                finally:
+                    timings[name + "_seconds"] = time.perf_counter() - begin
+            if self.recent_memory is None:
+                return measured("long", self._ingest_long_term)
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="memory-write") as pool:
+                recent = pool.submit(measured, "recent", self.recent_memory.ingest_batch)
+                long_term = pool.submit(measured, "long", self._ingest_long_term)
+                try:
+                    result = long_term.result()
+                except Exception as exc:
+                    result = BackendIngestResult(subject_id=batch.subject_id,
+                        errors=[f"long-term ingest: {exc}"])
+                try:
+                    recent.result()
+                except Exception as exc:
+                    result.errors.append(f"recent ingest: {exc}")
+            self.last_ingest_timings = {**timings, "total_seconds": time.perf_counter() - started}
+            # Long-term receipts remain persisted even if the recent store failed.
+            # On retry, recover them without acknowledging a Mem0-only write.
+            if not result.errors and self.stored_marks_repo is not None:
+                wanted = {e.segment_id for e in batch.experiences}
+                wanted.update(s.segment_id for e in batch.experiences for s in e.sub_segments)
+                for identity, events in self.stored_marks_repo.get_many(batch.subject_id, wanted).items():
+                    result.stored_marks.setdefault(identity, events)
+                # A prior write may have persisted its event/receipt but failed
+                # indexing. Retry that derived index before acknowledging it.
+                if self.recall_pipeline is not None:
+                    recovered = {eid for ids in result.stored_marks.values() for eid in ids}
+                    try:
+                        for eid in recovered - set(result.sealed_event_ids):
+                            event = self.event_repo.get(eid)
+                            if event is not None:
+                                self.recall_pipeline.index_event(event)
+                    except Exception as exc:
+                        result.errors.append(f"retry index: {exc}")
+            if result.errors:
+                result.stored_marks.clear()
+                raise MemoryIngestError(result)
+            return result
+
+    def _ingest_long_term(self, batch: MemoryBatch) -> BackendIngestResult:
         """记忆写入：整批合并为一段输入走一次代谢（与 rems3 整批语义对齐），
         再按事件内容归属回各 segment 写 stored_marks / 对象时间线 / 向量索引。
         空文本段按契约报错并跳过；单批失败进 ``errors``。
@@ -436,9 +526,7 @@ class REMSPipeline:
                 self._candidate_call = 0
             self._candidate_call = getattr(self, "_candidate_call", 0) + 1
             call = self._candidate_call
-        fragments = self.recall_pipeline.recall(
-            subject_id,
-            query,
+        kwargs = dict(
             object_id=object_id,
             object_ids=object_ids,
             interlocutor_object_id=(
@@ -456,6 +544,46 @@ class REMSPipeline:
             # 只有开诊断时才多传参数，保持默认调用契约不变。
             **({"candidate_sink": sink, "candidate_call": call} if sink is not None else {}),
         )
+        recent_store = getattr(self, "recent_memory", None)
+        if recent_store is None:
+            fragments = self.recall_pipeline.recall(subject_id, query, **kwargs)
+        else:
+            from .recall.fusion import merge_memories
+            budget = budget_chars if budget_chars is not None else (
+                self.config.recall_budget_chars or self.config.physical_redline)
+            if not query.strip() or budget <= 0 or (limit is not None and limit <= 0):
+                return ()
+            errors = []
+            def long_recall():
+                args = {**kwargs, "reinforce": False, "limit": self.config.recent_memory.search_limit}
+                found = self.recall_pipeline.recall(subject_id, query, **args)
+                if not found and not expand_raw:
+                    found = self.recall_pipeline.recall(subject_id, query,
+                        **{**args, "channels": ("lexical",), "expand_raw": True})
+                return found
+            with ThreadPoolExecutor(max_workers=2, thread_name_prefix="memory-read") as pool:
+                tasks = [("long-term", pool.submit(long_recall)),
+                    ("recent", pool.submit(recent_store.recall, subject_id, query,
+                        object_id=object_id, object_ids=object_ids,
+                        interlocutor_object_id=interlocutor_object_id, time_range=time_range))]
+                groups = []
+                for name, future in tasks:
+                    try:
+                        groups.append(future.result())
+                    except Exception as exc:
+                        errors.append(f"{name}: {exc}")
+                        logger.exception("%s recall failed", name)
+                        groups.append(())
+            self.last_recall_errors = errors
+            if len(errors) == 2:
+                raise RuntimeError("Both memory stores failed: " + "; ".join(errors))
+            fragments = merge_memories(*groups, budget_chars=budget, limit=limit)
+            if do_reinforce:
+                for identity in {f.event_id for f in fragments if f.type != "unclosed"
+                                 and not f.event_id.startswith("mem0:")}:
+                    event = self.event_repo.get(identity)
+                    if event is not None:
+                        self.recall_pipeline._reinforce(event)
         self._record_recall_trace(
             subject_id,
             query,
@@ -521,8 +649,9 @@ class REMSPipeline:
         """预算受限的回忆块：条目 + 各级文本 + 总长（供上层组装上下文）。"""
         if self.recall_pipeline is None:
             return {"items": [], "total_length": 0, "budget": budget}
-        fragments = self.recall_pipeline.recall(
+        fragments = self.recall(
             subject_id, query, object_id=object_id, level=level, limit=limit, anchor_event_ids=anchor_event_ids,
+            budget_chars=budget,
             **({} if self.config.recall_reinforce_enabled else {"reinforce": False}),
         )
         items: list[RecalledFragment] = list(fragments)
@@ -533,7 +662,7 @@ class REMSPipeline:
             pfrag = self._make_portrait_fragment(subject_id, object_id)
             if pfrag is not None:
                 items = [pfrag] + items
-        b = budget or (self.recall_budget.budget_chars() if self.recall_budget else None)
+        b = budget if budget is not None else (self.recall_budget.budget_chars() if self.recall_budget else None)
         selected = self.recall_budget.allocate(items, budget=b) if self.recall_budget else [
             {"fragment": it, "level": it.summary_level or "L1", "budget": len(it.content or it.text or "")}
             for it in items
@@ -669,3 +798,20 @@ class REMSPipeline:
         return self.belief_revision_service.tombstone_event(
             event_id, reason=reason, replacement_event_id=replacement_id
         )
+
+    def prepare_recall(self):
+        """Warm both independent local retrievers before accepting user requests."""
+        if self.recall_pipeline is not None:
+            self.recall_pipeline._embedding.embed_query("记忆检索准备")
+            ranker = self.recall_pipeline._reranker
+            if ranker is not None and hasattr(ranker, "_ensure"):
+                ranker._ensure()
+        if self.recent_memory is not None:
+            self.recent_memory.prepare()
+
+    def close(self):
+        if self.recent_memory is not None:
+            self.recent_memory.close()
+        if self.recall_pipeline is not None:
+            self.recall_pipeline._vector_store._client.close()
+        self.db.engine.dispose()

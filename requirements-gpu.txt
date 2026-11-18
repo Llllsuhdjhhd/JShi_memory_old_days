@@ -1,0 +1,5 @@
+# Verified in this project's existing Windows x64 / Python 3.14 environment.
+# Install with the project's .venv Python, not the base/global interpreter.
+--extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.14.0+cu130
+torchvision==0.29.1+cu130

@@ -304,9 +304,9 @@ def test_memory_buffer_hides_residual_id_and_program_keeps_it(
     user = fake_llm.calls[-1]["messages"][1]["content"]
     assert stable_id not in user
     assert "已有残影" not in user
-    assert "[1] 甲说周末。" in user
-    assert "[2] 乙问晚饭。" in user
-    assert "[3] 甲还没定。" in user
+    assert "[1] 来源时间：时间未知｜甲说周末。" in user
+    assert "[2] 来源时间：时间未知｜乙问晚饭。" in user
+    assert "[3] 来源时间：时间未知｜甲还没定。" in user
     again = metabolism_service._repo.get_unclosed_events()
     assert len(again) == 1
     assert again[0].id == stable_id

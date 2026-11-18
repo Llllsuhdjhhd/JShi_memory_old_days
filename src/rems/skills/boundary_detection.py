@@ -193,13 +193,28 @@ class BoundaryDetectionSkill:
         if lightweight:
             ev_len = 0
         factor = float(self._config.event_len_factor or 2)
+        memory_buffer = format_indexed_text(sentences) or "（无）"
+        if not lightweight and buffer_items is not None:
+            from ..utils.event_time import label
+            memory_buffer = "\n".join(
+                f"[{i+1}] 来源时间：{label(item.occurred_at)}｜{item.text}"
+                for i, item in enumerate(item for item in buffer_items if item.text)
+            ) or "（无）"
         user_msg = BOUNDARY_USER.format(
-            memory_buffer=format_indexed_text(sentences) or "（无）",
+            memory_buffer=memory_buffer,
             ev_len=ev_len,
             k=f"{factor:g}",
         )
         system_msg = build_user_mode_block(self._config) + (
             self._small_event_system() if lightweight else BOUNDARY_SYSTEM)
+        if not lightweight:
+            system_msg += (
+                "\n来源时间是事件归属的判断证据，不是固定切分间隔。只有原话支持同一事项的"
+                "延续、补充或结果时才跨日期合并；相同人物或话题本身不证明是同一事件。"
+                "区分原计划、后续修改和实际结果，不把不同日期描述成同一次现场。"
+                "时间未知时不补写日期、不假定连续发生；时间标签不计入原文字数。"
+                "跨日期不豁免 ev_len 与 k 的长度约束，短材料仍留在 residual。"
+            )
         if lightweight:
             if buffer_items is not None:
                 from ..utils.event_time import cohorts, label

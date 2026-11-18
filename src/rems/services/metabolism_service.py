@@ -474,7 +474,8 @@ class MetabolismService:
     def _admit_items(self, raw_input, memory, pending):
         """A partially acknowledged batch may replay both pending and sealed sources."""
         incoming = self._bounded_sentences(_new_buffer_items(raw_input, memory))
-        if not self._config.memory_refinement.enabled or memory is None:
+        # Retry ownership applies to full events as well as lightweight events.
+        if memory is None:
             return incoming
         seen = {item.fragment_id for item in pending if item.fragment_id}
         if self._event_repo is not None:
